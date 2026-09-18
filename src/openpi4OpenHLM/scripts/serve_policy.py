@@ -20,6 +20,7 @@ class EnvMode(enum.Enum):
     LIBERO = "libero"
     TWIST2G1 = "twist2_g1"
     SONICG1 = "sonic_g1"
+    JAKA = "jaka_tabletop_pick"
 
 
 @dataclasses.dataclass
@@ -88,6 +89,13 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.SONICG1: Checkpoint(
         config="pi05_g1_pick_sprite_turnback",
         dir="checkpoints/pi05_g1_pick_sprite/g1_pick_sprite_bs64/20000",
+    ),
+    # Trained with: scripts/train_pytorch.py jaka_tabletop_pick
+    #                   --exp-name jaka_tabletop_pick_v1 --save-interval 5000
+    # Adjust the step to match the checkpoint you actually want to serve.
+    EnvMode.JAKA: Checkpoint(
+        config="jaka_tabletop_pick",
+        dir="checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000",
     ),
 }
 

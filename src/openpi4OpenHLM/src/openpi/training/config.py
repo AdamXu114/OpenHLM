@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.g1_policy as g1_policy
+import openpi.policies.jaka_policy as jaka_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -426,6 +427,91 @@ class LeRobotG1DataConfig(DataConfigFactory):
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask, use_first_action=self.use_first_action_delta)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask, use_first_action=self.use_first_action_delta)],
+            )
+
+        # Model transforms include tokenization and other model-specific preprocessing.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=self.use_quantile_norm,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotJakaDataConfig(DataConfigFactory):
+    """
+    Data config for the Jaka whole-body teleop dataset in LeRobot format.
+
+    The dataset is recorded by ``simple/cli/teleop_jaka_mf.py`` with a single
+    head camera, in MuJoCo joint order, and is reordered into the G1/OpenPI
+    convention by ``examples/jaka/merge_teleop_jaka_mf.py`` -- arms first, then
+    legs, waist, neck, root. Note Jaka puts root LAST, whereas G1's layout has it
+    first. Layouts after that reordering:
+      - state (30 dims):
+          0-11  (12 dims): arms -- left shoulder pitch/roll/yaw, elbow, wrist
+                           roll/yaw (6), then the same six for the right arm
+          12-23 (12 dims): legs -- left hip pitch/roll/yaw, knee, ankle
+                           pitch/roll (6), then the same six for the right leg
+          24    (1 dim):   waist yaw
+          25-26 (2 dims):  neck yaw, neck pitch
+          27-29 (3 dims):  root -- roll, pitch (absolute), yaw_vel (a velocity)
+      - actions (40 dims): the same 30 dims, then the recorded anchor dims
+          30-32 (3 dims):  anchor_lin_vel -- already a velocity at collection
+                           time; no transform is applied on the training side
+          33-35 (3 dims):  anchor_pos_w
+          36-39 (4 dims):  anchor_quat_w
+
+    Training keeps only the first 33 action dims (see ``JakaInputs``), which is
+    why ``action_dim=33`` rather than 40; the last 7 anchor dims are dropped.
+
+    Actions are absolute reference joint targets; the delta transform converts
+    the 27 joint dims relative to the current state (root rpy and anchor_lin_vel
+    stay absolute).
+    """
+
+    use_delta_joint_actions: bool = True
+    use_quantile_norm: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Map the dataset keys (as returned by the LeRobot loader) to the keys
+        # expected by the data transforms. Only applied to dataset data,
+        # not during inference.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "head_image_left": "head_image_left",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # The data transforms are applied to data from the dataset AND during inference.
+        # JakaInputs fills in the two missing wrist views as black placeholders
+        # (masked out); JakaOutputs extracts the 33 action dimensions.
+        data_transforms = _transforms.Group(
+            inputs=[jaka_policy.JakaInputs(model_type=model_config.model_type)],
+            outputs=[jaka_policy.JakaOutputs()],
+        )
+
+        # Convert the 27 joint action dims to deltas relative to the current
+        # state. Dims 27-29 (root rpy) and 30-32 (anchor_lin_vel) stay absolute.
+        # make_bool_mask(27, -3) creates (True x 27, False x 3), length 30.
+        # The mask is shorter than the action dim (33); DeltaActions only
+        # subtracts over mask[:30], leaving dims 30-32 untouched.
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(27, -3)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
         # Model transforms include tokenization and other model-specific preprocessing.
@@ -888,7 +974,41 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="~/.cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        pytorch_weight_path="/workspace/openpi-assets/checkpoints/pi05_base_pytorch",
+        num_train_steps=30_000,
+        save_interval=10_000,
+    ),
+    TrainConfig(
+        # Smoke-test config for the Jaka whole-body teleop dataset
+        # (single head camera; state 30-dim = 27 joints + root rpy/yaw_vel 3;
+        # actions 40-dim in the dataset, of which the model trains on the first
+        # 33 = the 30 shared dims + anchor_lin_vel 3).
+        # action_dim is 33, not 40: JakaInputs drops the last 7 dims
+        # (anchor_pos_w + anchor_quat_w), since PadStatesAndActions only pads and
+        # never truncates. anchor_lin_vel is already a velocity at collection   
+        # time, so it passes through unchanged. The state is zero-padded to 33 by
+        # PadStatesAndActions for the model input.
+        # Run with HF_LEROBOT_HOME pointing at the directory that contains
+        # `teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0`.
+        name="jaka_tabletop_pick",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=33, action_horizon=50, discrete_state_input=True),
+        data=LeRobotJakaDataConfig(
+            repo_id="teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        batch_size=8,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=30000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/workspace/openpi-assets/checkpoints/pi05_base_pytorch",
         num_train_steps=30_000,
         save_interval=10_000,
     ),

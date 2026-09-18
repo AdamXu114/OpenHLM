@@ -398,7 +398,7 @@ def load_model_with_action_proj_expansion(
         logging.warning(f"Missing keys in checkpoint: {missing}")
     if unexpected:
         logging.warning(f"Unexpected keys in checkpoint: {unexpected}")
-    
+
     logging.info("Weight surgery completed successfully")
     return missing, unexpected
 

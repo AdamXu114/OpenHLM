@@ -392,3 +392,4 @@ cython_debug/
 *_demonstration
 *.o
 OrinVideoSender*
+data/*

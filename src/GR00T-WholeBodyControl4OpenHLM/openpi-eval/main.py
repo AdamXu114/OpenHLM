@@ -12,6 +12,7 @@ import signal
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 import cv2
 import numpy as np
 import tqdm
@@ -20,6 +21,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
 from sonic_g1_env import SonicG1Env, DEFAULT_MIMIC_OBS_G1, DEFAULT_MIMIC_OBS_G1_RAISED
+from jaka_tabletop_env import JakaTabletopEnv, DEFAULT_STATE_JAKA
 
 ########################################################
 # copy and paste the following code to SONIC codebase
@@ -53,11 +55,14 @@ class Args:
     remote_host: str = "0.0.0.0"
     remote_port: int = 8000
 
+    # Environment selection
+    env: Literal["sonic_g1", "jaka_tabletop_pick"] = "sonic_g1"
+
     # Evaluation parameters
     max_steps: int = 1000
     # Fixed instruction as requested
     instruction: str = "Pick up the purple soft finger on the table and place it on the mouse pad."
-    
+
     # Control parameters
     control_hz: int = 30
     # Policy action horizon is 50, so we can run open loop for up to 25 steps
@@ -72,6 +77,24 @@ class Args:
     body_state_port: int = 5557
     mock: bool = False
     num_frames_to_send: int = 2  # Number of frames to buffer before sending a single ZMQ message
+
+    # Robot network parameters (JakaTabletopEnv)
+    # The receiver (RealtimeMotionBufferVla) subscribes to tcp://127.0.0.1:28701.
+    jaka_motion_zmq_address: str = "*"
+    jaka_motion_zmq_port: int = 28701
+    # Placeholder observation channels -- contract pending with the downstream host app.
+    jaka_state_address: str = "127.0.0.1"
+    jaka_state_port: int = 28702
+    jaka_head_image_address: str = "127.0.0.1"
+    jaka_head_image_port: int = 28703
+    # Anchor (waist_yaw_Link) initial pose; the yaw component is only a seed, it then
+    # accumulates yaw_vel. z feeds the tracker's absolute root_z_mf, so it defaults to
+    # the recorded standing waist height (~0.83 m); x/y are an arbitrary origin
+    # (root_pos_diff_b is translation-invariant). The dataset means are
+    # (12.53212, 4.91023, 0.82769) for the position and
+    # (0.80923, 0.01067, 0.01590, -0.05691) for the wxyz quaternion.
+    jaka_initial_anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.83)
+    jaka_initial_anchor_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)  # radians
 
     # Visualization
     opencv_visualize: bool = True
@@ -144,6 +167,93 @@ class DefaultPosePolicyClient:
         return {"actions": np.tile(self.default_action, (self.chunk_size, 1))}
 
 
+class JakaDefaultPosePolicyClient:
+    def __init__(self, action_dim=33, chunk_size=50):
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+
+        # (33,) = the dataset-mean 30-dim state followed by a zero anchor_lin_vel.
+        self.default_action = np.concatenate([
+            DEFAULT_STATE_JAKA,
+            np.zeros(3, dtype=np.float32),
+        ]).astype(np.float32)
+
+    def infer(self, request_data):
+        time.sleep(0.1)  # Simulate 100ms inference time
+        # Return a chunk of default actions
+        return {"actions": np.tile(self.default_action, (self.chunk_size, 1))}
+
+
+def display_window_name(env_name):
+    if env_name == "sonic_g1":
+        return "Robot Cameras (Head | Left Wrist | Right Wrist)"
+    return "Robot Camera (Head)"
+
+
+def build_display_frame(env_name, obs, instruction):
+    """Build the annotated BGR frame shown/written for one control step.
+
+    ``sonic_g1`` concatenates the head and both wrist views; ``jaka_tabletop_pick``
+    has a single head camera, so the frame is just that view.
+    """
+    display_size = 480
+    views = [image_tools.resize_with_pad(obs["head_image_left"], display_size, display_size)]
+    if env_name == "sonic_g1":
+        views.append(image_tools.resize_with_pad(obs["left_wrist_image"], display_size, display_size))
+        views.append(image_tools.resize_with_pad(obs["right_wrist_image"], display_size, display_size))
+    combined_image = np.concatenate(views, axis=1)
+    combined_image_bgr = cv2.cvtColor(combined_image, cv2.COLOR_RGB2BGR)
+
+    # Overlay instruction text at the bottom center of the frame
+    prompt_text = f"Prompt: {instruction}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 2
+    padding = 8
+    frame_h, frame_w = combined_image_bgr.shape[:2]
+    (text_w, text_h), baseline = cv2.getTextSize(prompt_text, font, font_scale, thickness)
+    text_x = (frame_w - text_w) // 2
+    text_y = frame_h - padding - baseline
+    # Draw a dark background rectangle for readability
+    cv2.rectangle(
+        combined_image_bgr,
+        (text_x - padding, text_y - text_h - padding),
+        (text_x + text_w + padding, text_y + baseline + padding),
+        (0, 0, 0),
+        cv2.FILLED,
+    )
+    cv2.putText(combined_image_bgr, prompt_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return combined_image_bgr
+
+
+def build_policy_request(env_name, obs, instruction, last_executed_action):
+    """Build the policy request dict for the selected environment.
+
+    The key sets differ: ``jaka_tabletop_pick`` (JakaInputs) reads bare keys and
+    synthesizes the masked-out wrist views server-side, so they must not be sent;
+    ``sonic_g1`` (G1Inputs) reads the ``observation/`` prefixed keys.
+    """
+    if env_name == "jaka_tabletop_pick":
+        request_data = {
+            "head_image_left": image_tools.resize_with_pad(obs["head_image_left"], 224, 224),
+            "state": obs["state"],
+            "prompt": instruction,
+        }
+    else:
+        request_data = {
+            "observation/head_image_left": image_tools.resize_with_pad(obs["head_image_left"], 224, 224),
+            "observation/left_wrist_image": image_tools.resize_with_pad(obs["left_wrist_image"], 224, 224),
+            "observation/right_wrist_image": image_tools.resize_with_pad(obs["right_wrist_image"], 224, 224),
+            "observation/state": obs["state"],
+            "prompt": instruction,
+        }
+    if last_executed_action is not None:
+        # JakaInputs forwards this to ``last_action``; unused with absolute actions,
+        # and required by the G1 delta-action path.
+        request_data["observation/last_action"] = last_executed_action
+    return request_data
+
+
 def main(args: Args):
     if args.debug:
         import debugpy
@@ -153,40 +263,70 @@ def main(args: Args):
         debugpy.wait_for_client()
         print("Debugger attached, continuing execution...")
 
-    action_dim = 34
-    state_dim = 34
-    print(f"Using action_dim={action_dim}, state_dim={state_dim}")
+    # Per-environment action/state dimensionality and camera count
+    if args.env == "sonic_g1":
+        action_dim, state_dim = 34, 34
+        num_cameras = 3
+    else:
+        action_dim, state_dim = 33, 30
+        num_cameras = 1  # jaka has a single head camera; JakaInputs masks the wrist views
+    print(f"Using env={args.env}, action_dim={action_dim}, state_dim={state_dim}")
 
     # Initialize the environment
-    env = SonicG1Env(
-        control_hz=args.control_hz,
-        mock=args.mock,
-        vision_server_address=args.vision_server_address,
-        vision_server_port=args.vision_server_port,
-        wrist_server_port=args.wrist_server_port,
-        action_zmq_port=args.action_zmq_port,
-        body_state_address=args.body_state_address,
-        body_state_port=args.body_state_port,
-        num_frames_to_send=args.num_frames_to_send,
-    )
-    print("Initialized SonicG1Env")
+    if args.env == "sonic_g1":
+        env = SonicG1Env(
+            control_hz=args.control_hz,
+            mock=args.mock,
+            vision_server_address=args.vision_server_address,
+            vision_server_port=args.vision_server_port,
+            wrist_server_port=args.wrist_server_port,
+            action_zmq_port=args.action_zmq_port,
+            body_state_address=args.body_state_address,
+            body_state_port=args.body_state_port,
+            num_frames_to_send=args.num_frames_to_send,
+        )
+        print("Initialized SonicG1Env")
+    else:
+        env = JakaTabletopEnv(
+            control_hz=args.control_hz,
+            mock=args.mock,
+            motion_zmq_address=args.jaka_motion_zmq_address,
+            motion_zmq_port=args.jaka_motion_zmq_port,
+            state_address=args.jaka_state_address,
+            state_port=args.jaka_state_port,
+            head_image_address=args.jaka_head_image_address,
+            head_image_port=args.jaka_head_image_port,
+            num_frames_to_send=args.num_frames_to_send,
+            initial_anchor_pos=args.jaka_initial_anchor_pos,
+            initial_anchor_rpy=args.jaka_initial_anchor_rpy,
+        )
+        print("Initialized JakaTabletopEnv")
 
-    print("\nResetting robot to default pose (arms down)...")
-    obs = env.reset(default_pose=DEFAULT_MIMIC_OBS_G1)
-    time.sleep(2.5)  # Wait for 2.5 seconds to ensure the robot is in the default pose
-    print("Reset to arms down complete.")
-    print("\nResetting robot to raised pose (arms up)...")
-    obs = env.reset(default_pose=DEFAULT_MIMIC_OBS_G1_RAISED)
-    time.sleep(2.5)  # Wait for 2.5 seconds to ensure the robot is in the raised pose
-    print("Reset to arms up complete.")
+    if args.env == "sonic_g1":
+        print("\nResetting robot to default pose (arms down)...")
+        obs = env.reset(default_pose=DEFAULT_MIMIC_OBS_G1)
+        time.sleep(2.5)  # Wait for 2.5 seconds to ensure the robot is in the default pose
+        print("Reset to arms down complete.")
+        print("\nResetting robot to raised pose (arms up)...")
+        obs = env.reset(default_pose=DEFAULT_MIMIC_OBS_G1_RAISED)
+        time.sleep(2.5)  # Wait for 2.5 seconds to ensure the robot is in the raised pose
+        print("Reset to arms up complete.")
+    else:
+        # JakaTabletopEnv publishes reference frames only; there is no pose to command.
+        print("\nResetting JakaTabletopEnv (clears the 2-frame window)...")
+        obs = env.reset()
+        print("Reset complete.")
 
     # Connect to the policy server
-    # We assume a server is running with a G1-compatible policy
+    # We assume a server is running with a policy matching the selected environment
     if args.use_fake_policy:
         policy_client = FakePolicyClient(action_dim=action_dim)
         print("\033[93m\nUsing FakePolicyClient (simulated inference)\033[0m")
     elif args.use_default_pose_policy:
-        policy_client = DefaultPosePolicyClient(action_dim=action_dim)
+        if args.env == "sonic_g1":
+            policy_client = DefaultPosePolicyClient(action_dim=action_dim)
+        else:
+            policy_client = JakaDefaultPosePolicyClient(action_dim=action_dim)
         print("\033[93m\nUsing DefaultPosePolicyClient (sending default pose)\033[0m")
     else:
         policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
@@ -196,13 +336,7 @@ def main(args: Args):
     print("\nWarming up policy server...")
     start_time = time.time()
     for _ in range(10):
-        result = policy_client.infer({
-            "observation/head_image_left": image_tools.resize_with_pad(obs["head_image_left"], 224, 224),
-            "observation/left_wrist_image": image_tools.resize_with_pad(obs["left_wrist_image"], 224, 224),
-            "observation/right_wrist_image": image_tools.resize_with_pad(obs["right_wrist_image"], 224, 224),
-            "observation/state": obs["state"],
-            "prompt": args.instruction,
-        })
+        result = policy_client.infer(build_policy_request(args.env, obs, args.instruction, None))
     print(f"Policy server warmed up in {time.time() - start_time:.3f} seconds.")
 
     # Generate timestamp once for all episodes (used for saving action chunks)
@@ -235,7 +369,7 @@ def main(args: Args):
             display_size = 480
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             video_writer = cv2.VideoWriter(
-                str(video_path), fourcc, args.control_hz, (display_size * 3, display_size)
+                str(video_path), fourcc, args.control_hz, (display_size * num_cameras, display_size)
             )
             print(f"\nRecording video to: {video_path}")
 
@@ -275,35 +409,10 @@ def main(args: Args):
 
                 # Build combined BGR frame when display or video recording is needed
                 if args.opencv_visualize or args.save_video:
-                    display_size = 480
-                    head_image_resized = image_tools.resize_with_pad(obs["head_image_left"], display_size, display_size)
-                    left_wrist_resized = image_tools.resize_with_pad(obs["left_wrist_image"], display_size, display_size)
-                    right_wrist_resized = image_tools.resize_with_pad(obs["right_wrist_image"], display_size, display_size)
-                    combined_image = np.concatenate([head_image_resized, left_wrist_resized, right_wrist_resized], axis=1)
-                    combined_image_bgr = cv2.cvtColor(combined_image, cv2.COLOR_RGB2BGR)
-
-                    # Overlay instruction text at the bottom center of the frame
-                    prompt_text = f"Prompt: {instruction}"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.7
-                    thickness = 2
-                    padding = 8
-                    frame_h, frame_w = combined_image_bgr.shape[:2]
-                    (text_w, text_h), baseline = cv2.getTextSize(prompt_text, font, font_scale, thickness)
-                    text_x = (frame_w - text_w) // 2
-                    text_y = frame_h - padding - baseline
-                    # Draw a dark background rectangle for readability
-                    cv2.rectangle(
-                        combined_image_bgr,
-                        (text_x - padding, text_y - text_h - padding),
-                        (text_x + text_w + padding, text_y + baseline + padding),
-                        (0, 0, 0),
-                        cv2.FILLED,
-                    )
-                    cv2.putText(combined_image_bgr, prompt_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                    combined_image_bgr = build_display_frame(args.env, obs, instruction)
 
                     if args.opencv_visualize:
-                        cv2.imshow("Robot Cameras (Head | Left Wrist | Right Wrist)", combined_image_bgr)
+                        cv2.imshow(display_window_name(args.env), combined_image_bgr)
                         cv2.waitKey(1)
 
                     if args.save_video and video_writer is not None:
@@ -312,16 +421,9 @@ def main(args: Args):
                 # Check if we need to query the policy for a new chunk of actions
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     # Prepare data for the policy
-                    # The keys must match what the policy input transform (G1Inputs) expects.
-                    request_data = {
-                        "observation/head_image_left": image_tools.resize_with_pad(obs["head_image_left"], 224, 224),
-                        "observation/left_wrist_image": image_tools.resize_with_pad(obs["left_wrist_image"], 224, 224),
-                        "observation/right_wrist_image": image_tools.resize_with_pad(obs["right_wrist_image"], 224, 224),
-                        "observation/state": obs["state"],
-                        "prompt": instruction,
-                    }
-                    if last_executed_action is not None:
-                        request_data["observation/last_action"] = last_executed_action
+                    # The keys must match what the policy input transform expects
+                    # (G1Inputs for sonic_g1, JakaInputs for jaka_tabletop_pick).
+                    request_data = build_policy_request(args.env, obs, instruction, last_executed_action)
 
                     # Query the policy server
                     # The server will handle resizing and normalization if configured in the policy config
@@ -416,6 +518,7 @@ def main(args: Args):
             save_data = {
                 "episode_idx": episode_idx,
                 "timestamp": timestamp,
+                "env": args.env,
                 "total_steps": action_step_counter,
                 "action_chunk_shape": action_chunk_shape,
                 "action_chunks": action_chunk_records,
