@@ -82,11 +82,15 @@ class Args:
     # The receiver (RealtimeMotionBufferVla) subscribes to tcp://127.0.0.1:28701.
     jaka_motion_zmq_address: str = "*"
     jaka_motion_zmq_port: int = 28701
-    # Placeholder observation channels -- contract pending with the downstream host app.
+    # Observation channels -- these are SIMPLE's ``JakaTeleopZmqPublisher`` bind
+    # points (``state_zmq_bind`` / ``camera_zmq_bind`` in
+    # ``data/jaka_mf/teleop_jaka_mf.yaml``), i.e. what the teleop publishes while
+    # it drives the Jaka robot. Defaults changed 28702/28703 -> 28711/28712 to
+    # match; if the teleop config is edited, edit these too.
     jaka_state_address: str = "127.0.0.1"
-    jaka_state_port: int = 28702
+    jaka_state_port: int = 28711
     jaka_head_image_address: str = "127.0.0.1"
-    jaka_head_image_port: int = 28703
+    jaka_head_image_port: int = 28712
     # Anchor (waist_yaw_Link) initial pose; the yaw component is only a seed, it then
     # accumulates yaw_vel. z feeds the tracker's absolute root_z_mf, so it defaults to
     # the recorded standing waist height (~0.83 m); x/y are an arbitrary origin

@@ -15,6 +15,7 @@
 | [04-deployment.md](04-deployment.md) | 策略服务端 + 仿真/真机推理部署 |
 | [05-troubleshooting.md](05-troubleshooting.md) | 踩坑记录与排查方法（**建议先读**） |
 | [06-cheatsheet.md](06-cheatsheet.md) | 一页速查表，复制粘贴用 |
+| [07-jaka-deploy-tutorial.md](07-jaka-deploy-tutorial.md) | Jaka 部署教程（部署机原生运行、无容器无预约）：最终命令、端口、坑 |
 
 另有 [../src/openpi4OpenHLM/inference.md](../src/openpi4OpenHLM/inference.md)（上游推理流程）、
 `~/Base_bash.md`（主机层基础命令：进容器 / 预约显卡 / 翻墙）。

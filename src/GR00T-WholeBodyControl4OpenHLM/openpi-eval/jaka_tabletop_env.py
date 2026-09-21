@@ -39,11 +39,13 @@ first), the anchor (``waist_yaw_Link``) world pose, and a strictly monotonic
 """
 
 import json
+import struct
 import time
 from collections import defaultdict, deque
 
 import numpy as np
 import zmq
+from scipy.spatial.transform import Rotation as R
 
 from sonic_g1_env import _euler_xyz_to_quat_wxyz, pack_pose_message
 
@@ -182,9 +184,9 @@ class JakaTabletopEnv:
         motion_zmq_address: str = "*",
         motion_zmq_port: int = 28701,
         state_address: str = "127.0.0.1",
-        state_port: int = 28702,
+        state_port: int = 28711,
         head_image_address: str = "127.0.0.1",
-        head_image_port: int = 28703,
+        head_image_port: int = 28712,
         num_frames_to_send: int = 2,
         initial_anchor_pos: tuple = DEFAULT_INITIAL_ANCHOR_POS,
         initial_anchor_rpy: tuple = DEFAULT_INITIAL_ANCHOR_RPY,
@@ -198,10 +200,10 @@ class JakaTabletopEnv:
                 downstream stream can be exercised offline).
             motion_zmq_address / motion_zmq_port: Bind address of the action PUB
                 socket. The receiver connects to ``tcp://127.0.0.1:28701``.
-            state_address / state_port: PLACEHOLDER source of the 30-dim state
-                (the downstream host app has yet to fix this channel).
-            head_image_address / head_image_port: PLACEHOLDER source of the head
-                camera image.
+            state_address / state_port: Source of the 30-dim state. Defaults to
+                SIMPLE's ``JakaTeleopZmqPublisher.state_zmq_bind`` (28711).
+            head_image_address / head_image_port: Source of the head camera
+                image. Defaults to SIMPLE's ``camera_zmq_bind`` (28712).
             num_frames_to_send: Frames buffered per ZMQ message (2 = sliding
                 window ``[i-1, i]``, matching the receiver's dedup contract).
             initial_anchor_pos: Anchor (``waist_yaw_Link``) initial world position.
@@ -244,21 +246,40 @@ class JakaTabletopEnv:
         else:
             self._zmq_socket = None
 
-        # PLACEHOLDER observation channels -- contract to be finalized with the
-        # downstream host app:
-        #   topic b"jaka_state": msgpack {"joint_pos": (27,) f32 in SIM order,
-        #                                 "root_roll": f32, "root_pitch": f32,
-        #                                 "yaw_vel": f32}
-        #   topic b"jaka_head":  msgpack {"image": (H, W, 3) uint8 RGB}
+        # Observation channels -- these match SIMPLE's ``JakaTeleopZmqPublisher``
+        # (``jaka_zmq_pub.py``) verbatim, which is what the teleop/recorder process
+        # already publishes while the Jaka robot runs under it:
+        #
+        #   state  (:28711, ``state_zmq_bind``) -- raw JSON, NO topic prefix:
+        #     {"publish_t_ns": i64, "smplx_t_ns": i64, "paused": bool, "seq": i64,
+        #      "joint_pos": (27,) f32  in JAKA/MuJoCo order,
+        #      "body_pos_w": (nb, 3) f32, "body_quat_w": (nb, 4) wxyz,
+        #      "qpos": (nq,) f32}
+        #     ``body_quat_w[0]`` is ``base_link`` in BOTH body orderings, which is
+        #     what the recorded ``state[27:30]`` (roll/pitch/yaw_vel) is built from.
+        #
+        #   camera (:28712, ``camera_zmq_bind``) -- raw bytes, NO topic prefix:
+        #     struct.pack("iii", w, h, c) + HWC uint8 RGB payload
+        #
+        # Both sockets SUBSCRIBE to b"" (everything) and use CONFLATE=1: the
+        # publisher is latest-only, so a slow consumer must drop stale frames
+        # rather than queue them.
         self._state_sub = self._zmq_context.socket(zmq.SUB)
-        self._state_sub.setsockopt(zmq.SUBSCRIBE, b"jaka_state")
+        self._state_sub.setsockopt(zmq.SUBSCRIBE, b"")
         self._state_sub.setsockopt(zmq.CONFLATE, 1)
         self._head_sub = self._zmq_context.socket(zmq.SUB)
-        self._head_sub.setsockopt(zmq.SUBSCRIBE, b"jaka_head")
+        self._head_sub.setsockopt(zmq.SUBSCRIBE, b"")
         self._head_sub.setsockopt(zmq.CONFLATE, 1)
         if not self.mock:
             self._state_sub.connect(f"tcp://{state_address}:{state_port}")
             self._head_sub.connect(f"tcp://{head_image_address}:{head_image_port}")
+
+        # ``yaw_vel`` is not carried on the wire: it is differentiated here from
+        # ``base_link``'s world yaw, exactly like the recording side's
+        # ``OpenHLMRootVel`` (wrapped difference / wall-clock delta; 0.0 on the
+        # first frame). State lives here because it is a per-stream derivative.
+        self._prev_raw_yaw: float | None = None
+        self._prev_state_t_ns: int | None = None
 
     # ------------------------------------------------------------------
     # Action path
@@ -348,13 +369,23 @@ class JakaTabletopEnv:
         return self.get_observation()
 
     def _poll_observation(self):
-        """Non-blocking drain of the placeholder observation channels."""
-        import msgpack
-
+        """Non-blocking drain of SIMPLE's state (:28711) and camera (:28712) channels."""
         head = None
         try:
-            raw = self._head_sub.recv(zmq.NOBLOCK)
-            head = msgpack.unpackb(raw[len(b"jaka_head"):], raw=False).get("image")
+            buf = self._head_sub.recv(zmq.NOBLOCK)
+            if len(buf) >= 12:
+                w, h, c = struct.unpack("iii", buf[:12])
+                payload = buf[12:]
+                if len(payload) == w * h * c and c in (3, 4):
+                    img = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, c))
+                    head = img[..., :3] if c == 4 else img  # BGRA -> RGB
+                else:
+                    print(
+                        f"Error reading jaka head image: header says {w}x{h}x{c} "
+                        f"but payload is {len(payload)} bytes"
+                    )
+            else:
+                print(f"Error reading jaka head image: short frame ({len(buf)} bytes)")
         except zmq.Again:
             pass
         except Exception as e:  # noqa: BLE001
@@ -363,17 +394,37 @@ class JakaTabletopEnv:
         state = None
         try:
             raw = self._state_sub.recv(zmq.NOBLOCK)
-            m = msgpack.unpackb(raw[len(b"jaka_state"):], raw=False)
+            m = json.loads(raw.decode("utf-8"))
+
             joints_sim = np.asarray(m["joint_pos"], dtype=np.float32)
             if joints_sim.shape != (27,):
-                raise ValueError(f"jaka_state joint_pos must be (27,), got {joints_sim.shape}")
+                raise ValueError(f"jaka state joint_pos must be (27,), got {joints_sim.shape}")
+
+            # base_link is body 0 in both orderings; roll/pitch are absolute, and
+            # yaw_vel is differentiated here (see __init__).
+            quat_wxyz = np.asarray(m["body_quat_w"][0], dtype=np.float64)
+            n = float(np.linalg.norm(quat_wxyz))
+            if n < 1e-6:
+                raise ValueError("jaka state body_quat_w[0] is degenerate")
+            quat_wxyz /= n
+
+            t_ns = int(m.get("publish_t_ns") or m.get("smplx_t_ns") or 0)
+            roll, pitch, raw_yaw = R.from_quat(
+                [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+            ).as_euler("xyz")
+
+            yaw_vel = 0.0
+            if self._prev_raw_yaw is not None and self._prev_state_t_ns is not None:
+                dt = (t_ns - self._prev_state_t_ns) * 1e-9
+                if dt > 0.0:
+                    d_yaw = (raw_yaw - self._prev_raw_yaw + np.pi) % (2.0 * np.pi) - np.pi
+                    yaw_vel = float(d_yaw / dt)
+            self._prev_raw_yaw = float(raw_yaw)
+            self._prev_state_t_ns = t_ns
+
             state = np.concatenate([
                 joints_sim[PERM_SIM_TO_POLICY],
-                np.array([
-                    float(m["root_roll"]),
-                    float(m["root_pitch"]),
-                    float(m.get("yaw_vel", 0.0)),
-                ], dtype=np.float32),
+                np.array([float(roll), float(pitch), yaw_vel], dtype=np.float32),
             ])
         except zmq.Again:
             pass
