@@ -59,8 +59,20 @@ Run on the deployment machine with the policy server already up in another windo
 ``--episodes`` is a tyro tuple: SPACE separated, not commas. Bare ``--episodes`` = all 47.
 Cost is ``chunks x prompts x repeats`` inferences at ~80 ms each, plus one PNG decode per chunk.
 
-The server stalls its event loop while inferring, so the first call after a server restart hits the
-20 s ping timeout; ``--connect-retries`` reconnects and retries instead of aborting.
+Connection behaviour, because it bites every first run: the server blocks its event loop while
+inferring, and its FIRST inference after a restart also compiles the model -- far longer than the
+~80 ms steady state. openpi's client cannot survive that: it gives up at a 10 s handshake deadline
+and retries only on ``ConnectionRefusedError``, so a compiling server looks exactly like a dead one
+(``TimeoutError`` on the handshake, or ``InvalidMessage`` when the connection is dropped). Retrying
+does not help and can even prevent progress, because each attempt is killed before the compile can
+finish. So this script opens ONE long-lived connection up front, with keepalive off and a
+``--warmup-timeout-s`` deadline (default 300 s), and pays the compile there; only then does it start
+the measured loop, where ``--connect-retries`` x ``--retry-delay-s`` ride out ordinary stalls. The
+warmup prints a heartbeat every 15 s (``... still waiting on the first inference (45s)``) and gives
+up at ``--warmup-timeout-s``, so "still compiling" and "wedged" are told apart in the run itself
+rather than by staring at a blank terminal. Once the server has served a request, later runs against
+the SAME process connect immediately -- leave it running rather than restarting it between rounds of
+testing.
 """
 
 # flake8: noqa: E402
@@ -72,6 +84,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 import dataclasses
 import io
 import json
+import socket
 import time
 from pathlib import Path
 from typing import Literal
@@ -79,9 +92,11 @@ from typing import Literal
 import numpy as np
 import pyarrow.parquet as pq
 import tyro
+import websockets.sync.client
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from openpi_client import image_tools
+from openpi_client import msgpack_numpy
 from openpi_client import websocket_client_policy
 
 # The env's own helpers: the pose comparison must use the exact convention the robot executes,
@@ -176,15 +191,93 @@ class Episode:
 # Policy client
 # ---------------------------------------------------------------------------
 
-class PolicyClient:
-    """Websocket policy with reconnect-on-failure.
+def listener_ready(host: str, port: int, attempts: int, delay: float) -> bool:
+    """Wait (bounded) for something to accept TCP on host:port.
 
-    The server blocks its event loop during inference, so the first call after a restart dies on a
-    20 s ping timeout -- a known issue, not a misconfiguration. Retrying is the fix.
+    Distinguishes "no server" from "server busy": with nothing listening, openpi's own
+    ``_wait_for_server`` reconnect loop would spin forever and the script would hang with no
+    explanation, so this fails loudly instead.
+    """
+    for i in range(max(attempts, 1)):
+        try:
+            with socket.create_connection((host, port), timeout=3.0):
+                return True
+        except OSError:
+            if i == attempts - 1:
+                return False
+            print(f"    nothing listening on {host}:{port} yet "
+                  f"[{i + 1}/{attempts}] -- is serve_policy.py running?")
+            time.sleep(delay)
+    return False
+
+
+def recv_with_progress(conn, timeout_s: float, label: str, tick_s: float = 15.0):
+    """``recv`` bounded by a deadline, printing a heartbeat while it waits.
+
+    Without this the wait is a terminal that prints nothing at all -- indistinguishable from a wedged
+    server, which is exactly the ambiguity that made the first deployment attempt unreadable. Ticking
+    with a short ``recv(tick)`` is safe: a timed-out ``recv`` does NOT discard the message, because
+    websockets pushes the frames it already read back onto the queue, so the next call still returns
+    it (``websockets.sync.messages.Assembler.get`` -> ``reset_queue``).
+    """
+    t0 = time.time()
+    while True:
+        left = timeout_s - (time.time() - t0)
+        if left <= 0:
+            raise TimeoutError(f"no reply for {label} within {timeout_s:.0f}s")
+        try:
+            return conn.recv(min(tick_s, left))
+        except TimeoutError:
+            print(f"      ... still waiting on {label} ({time.time() - t0:.0f}s)", flush=True)
+
+
+def warm_up(host: str, port: int, timeout_s: float) -> float:
+    """Absorb the first-inference compile on ONE long-lived connection, and return its wall time.
+
+    openpi's own client cannot do this: it gives up at a 10 s handshake deadline and retries only on
+    ``ConnectionRefusedError``, so a server still compiling its first inference is indistinguishable
+    from a dead one -- and retrying makes it worse, because each attempt is killed before the compile
+    can finish. Connecting here with a generous deadline, keepalive off, and a dummy request lets the
+    expensive first inference complete once, up front, on a socket nobody will abort mid-way. The
+    policy is stateless, so this costs nothing but time; once it returns, every later call is fast.
+
+    Each read is deadline-bounded and prints a heartbeat, so a stalled server is reported with the
+    phase and the elapsed time instead of hanging the script with a blank terminal.
+    """
+    request = {
+        "head_image_left": np.zeros((224, 224, 3), np.uint8),   # black: values are not used
+        "state": np.zeros(30, np.float32),
+        "prompt": DEPLOY_PROMPT,
+    }
+    t0 = time.time()
+    with websockets.sync.client.connect(
+        f"ws://{host}:{port}", compression=None, max_size=None,
+        open_timeout=timeout_s, ping_interval=None,   # no ping: it must NOT be killed mid-compile
+    ) as conn:
+        print(f"      handshake ok ({time.time() - t0:.1f}s); reading server metadata", flush=True)
+        recv_with_progress(conn, 30.0, "server metadata")   # sent immediately after the handshake
+        print("      sending the dummy request -- the FIRST inference compiles the model, "
+              "so this is the slow one", flush=True)
+        conn.send(msgpack_numpy.Packer().pack(request))
+        response = recv_with_progress(conn, timeout_s, "the first inference")
+        if isinstance(response, str):                 # the server reports infer errors as text
+            raise SystemExit(f"server raised during the warmup inference:\n    {response[:2000]}")
+    return time.time() - t0
+
+
+class PolicyClient:
+    """Websocket policy with reconnect-and-WAIT, for transient failures (not the warmup).
+
+    The server blocks its event loop during inference, so a call that lands mid-inference dies on a
+    10 s handshake deadline or a 20 s ping timeout. Those are transport hiccups, not logic errors:
+    the retry must WAIT for the loop to free up, since an immediate reconnect just gets its handshake
+    dropped while the server is still busy. The one-off compile that makes the first inference slow
+    is handled separately by ``warm_up``, so these retries only need to ride out short stalls.
     """
 
-    def __init__(self, host: str, port: int, retries: int = 2):
-        self._host, self._port, self._retries = host, port, retries
+    def __init__(self, host: str, port: int, retries: int = 5, delay: float = 10.0):
+        self._host, self._port = host, port
+        self._retries, self._delay = max(retries, 0), delay
         self._client = None
 
     def _connect(self):
@@ -193,17 +286,27 @@ class PolicyClient:
         return self._client
 
     def infer(self, request: dict) -> np.ndarray:
-        last = None
+        last, t0 = None, time.time()
         for attempt in range(self._retries + 1):
             try:
                 return np.asarray(self._connect().infer(request)["actions"], dtype=np.float32)
-            except Exception as e:  # noqa: BLE001 - any transport failure is worth one retry
+            except Exception as e:  # noqa: BLE001 - any transport failure is worth another wait
                 last = e
                 self._client = None
                 if attempt < self._retries:
-                    print(f"    infer failed ({type(e).__name__}); reconnecting "
-                          f"[{attempt + 1}/{self._retries}]")
-        raise RuntimeError(f"policy server unreachable at {self._host}:{self._port}") from last
+                    print(f"    attempt {attempt + 1}/{self._retries + 1} failed "
+                          f"({type(e).__name__}) after {time.time() - t0:.0f}s; the server is "
+                          f"probably still compiling its first inference -- "
+                          f"waiting {self._delay:.0f}s")
+                    time.sleep(self._delay)
+        raise RuntimeError(
+            f"policy server at {self._host}:{self._port} did not answer in "
+            f"{self._retries + 1} attempts over {time.time() - t0:.0f}s "
+            f"(last: {type(last).__name__}: {last}).\n"
+            f"    If serve_policy.py is still loading or compiling, raise --connect-retries and/or "
+            f"--retry-delay-s and try again; once the model has served one request, later runs "
+            f"against the SAME server process connect immediately (leave it running)."
+        ) from last
 
     def close(self):
         client, self._client = self._client, None
@@ -411,7 +514,9 @@ class Args:
 
     remote_host: str = "127.0.0.1"
     remote_port: int = 8000
-    connect_retries: int = 2           # see the ping-timeout note in the module docstring
+    connect_retries: int = 5           # attempts per inference, for transient stalls
+    retry_delay_s: float = 10.0        # wait between those attempts
+    warmup_timeout_s: float = 300.0    # deadline for the one-off first inference (model compile)
 
     prompt: str = DEPLOY_PROMPT        # what the deployed client sends
     prompts: Literal["deploy", "train", "both"] = "deploy"  # "both" scores each frame twice
@@ -457,7 +562,30 @@ def main(args: Args):
           + ("   (pred-vs-pred noise floor enabled)" if args.repeats > 1 else ""))
     print("joint grps: " + ", ".join(f"{k}({len(v)})" for k, v in sorted(groups.items())))
 
-    client = PolicyClient(args.remote_host, args.remote_port, args.connect_retries)
+    # Short grace period only: a server that has not been started yet is a typo, not a warmup.
+    if not listener_ready(args.remote_host, args.remote_port, 2, args.retry_delay_s):
+        raise SystemExit(
+            f"nothing is accepting TCP on {args.remote_host}:{args.remote_port}.\n"
+            f"    Start the policy server first (doc/07 section 2), e.g.:\n"
+            f"      cd ~/Workspace/OpenHLM/src/openpi4OpenHLM\n"
+            f"      ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10"
+        )
+
+    print(f"warmup    : one dummy inference on a long-lived connection (the first one compiles the "
+          f"model; up to {args.warmup_timeout_s:.0f}s)")
+    try:
+        dt = warm_up(args.remote_host, args.remote_port, args.warmup_timeout_s)
+    except Exception as e:  # noqa: BLE001 - report the phase that stalled, don't guess
+        raise SystemExit(
+            f"warmup inference did not complete: {type(e).__name__}: {e}\n"
+            f"    Run jaka_policy_server_probe.py against the same server: it prints the elapsed time "
+            f"of the handshake, the metadata read, and the first inference separately, which says "
+            f"whether the server is slow, wedged, or raising."
+        ) from e
+    print(f"warmup    : {dt:.1f}s (later calls should be tens of ms)")
+
+    client = PolicyClient(args.remote_host, args.remote_port,
+                          args.connect_retries, args.retry_delay_s)
     records, rolled = [], {"pred": [], "gt": [], "ep": [], "t0": [], "prompt": []}
     t_start, n_calls = time.time(), 0
 
@@ -481,7 +609,16 @@ def main(args: Args):
                     req = build_request(image, state, text)
                     preds = []
                     for _ in range(max(args.repeats, 1)):
-                        preds.append(client.infer(req))
+                        chunk = client.infer(req)
+                        # Fail on the shape here, with the actual numbers, rather than let a wrong
+                        # action_dim surface later as a broadcasting error inside the metrics.
+                        if chunk.ndim != 2 or chunk.shape[1] < ACTION_DIM:
+                            raise SystemExit(
+                                f"server returned actions of shape {chunk.shape}; expected "
+                                f"(horizon, >= {ACTION_DIM}). The checkpoint's action_dim does not "
+                                f"match this env's action layout."
+                            )
+                        preds.append(chunk)
                         n_calls += 1
 
                     n_rows = min(len(preds[0]), len(gt))
@@ -497,7 +634,7 @@ def main(args: Args):
                     records.append(rec)
 
                     if args.dump:
-                        rolled["pred"].append(preds[0][:n_rows])
+                        rolled["pred"].append(preds[0][:n_rows, :ACTION_DIM])
                         rolled["gt"].append(gt[:n_rows])
                         rolled["ep"].append(ep)
                         rolled["t0"].append(t0)
