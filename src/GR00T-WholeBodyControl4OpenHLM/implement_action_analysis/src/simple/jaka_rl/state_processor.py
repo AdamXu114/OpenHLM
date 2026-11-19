@@ -139,6 +139,10 @@ class StateProcessor:
                 gap_threshold_s=float(
                     self.motion_config.get("motion_gap_threshold_s", 0.05)
                 ),
+                # enable_diagnostics=bool(
+                #     self.motion_config.get("motion_diagnostics", False)
+                # ),
+                enable_diagnostics=True
             )
             self.motion_joint_names = list(self.motion_buffer.joint_names)
             self.motion_body_names = list(self.motion_buffer.body_names)

@@ -142,8 +142,8 @@ HEAD_IMAGE_HEIGHT = 224
 HEAD_IMAGE_WIDTH = 224
 HEAD_IMAGE_CHANNELS = 3
 
-# 30-dim dataset mean in policy order (weighted over all 47 episodes of
-# teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0). Used only by the
+# 30-dim dataset mean in policy order (weighted over all 47 episodes of the legacy
+# teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0 set). Used only by the
 # offline ``JakaDefaultPosePolicyClient`` fake policy.
 DEFAULT_STATE_JAKA = np.array([
     -0.4613, -1.3431,  0.1592,  1.0753, -0.6990,  0.3478,   # left arm

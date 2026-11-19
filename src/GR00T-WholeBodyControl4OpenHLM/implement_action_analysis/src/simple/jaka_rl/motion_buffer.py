@@ -813,8 +813,9 @@ class RealtimeMotionBuffer:
 #   [2] frame_index 去重: 2 帧滑动窗口 [i-1, i] 中重叠帧只插入一次。
 #   [3] 时间戳重锚定: VLA 推理停顿期间数据时间轴"暂停", 恢复后新帧重锚为
 #       "上帧 + 名义帧周期", 数据轴上不留下停顿空洞(无大间隙插值)。
-#   [4] 数据驱动播放时钟: P = min(P + dt, 最新帧时间 - delay); 停顿期 P
-#       冻结 → 参考轨迹位级冻结(等价 sonic 的游标钳制), 延迟恒为 120ms。
+#   [4] 数据驱动播放时钟: P = min(P + 实测墙钟间隔, 最新帧时间 - delay);
+#       停顿期 P 冻结 → 参考轨迹位级冻结(等价 sonic 的游标钳制);
+#       P 与数据时间轴同为 1× 墙钟速率, 软实时循环抖动下延迟恒 120ms 不漂移。
 #   [5] cleanup 基于播放时钟 P(而非墙钟), 停顿期不删除未播放的保留尾巴。
 #
 # 二进制流只携带 anchor body 的位姿: 入库时只填 anchor 槽位
@@ -966,6 +967,8 @@ class RealtimeMotionBufferVla:
         nominal_frame_s: float = 1.0 / 30.0,  # 重锚定名义帧周期(30Hz)
         gap_threshold_s: float = 0.05,        # 到达间隙 > 此值判定为推理停顿
         align_first_frame_yaw: bool = True,
+        # 诊断监测开关(联调排查用): True 时输出事件日志 + 1Hz 聚合摘要
+        enable_diagnostics: bool = False,
     ):
         if dt_s <= 0.0:
             raise ValueError("dt_s must be positive")
@@ -1010,9 +1013,13 @@ class RealtimeMotionBufferVla:
         self._body_pos_w_frames: list[np.ndarray] = []  # (num_bodies, 3)
         self._body_quat_w_frames: list[np.ndarray] = []  # (num_bodies, 4) wxyz
 
-        # 播放时钟(仅 policy 线程经 get_obs() 访问; 假设每控制 tick 调用一次)
+        # 播放时钟(仅 policy 线程经 get_obs() 访问)。
+        # P 按两次 get_obs 间的实测墙钟间隔(monotonic)推进而非固定 _dt_ns:
+        # 与数据时间轴(按到达墙钟差推进)同为 1× 速率, 49~50Hz 软实时循环
+        # 抖动下延迟不会像固定 dt 方案那样随流式期线性漂移。
         self._playback_time_ns = 0
         self._playback_initialized = False
+        self._last_get_obs_wall_ns: int | None = None  # 上次 get_obs 的 monotonic 墙钟
 
         # ZMQ 接收线程专用
         self._last_arrival_wall_ns = 0  # 上次到达墙钟(仅用于间隙检测)
@@ -1026,6 +1033,32 @@ class RealtimeMotionBufferVla:
         self._align_yaw_deg: float | None = None
         self._ready_prev = False
         self._align_warned = False
+
+        # ── 诊断监测(enable_diagnostics=True 时输出; 计数器始终累计, 开销可忽略) ──
+        self._diag_enabled = bool(enable_diagnostics)
+        # 收包统计(ZMQ 接收线程写入; 诊断用途, 不追求跨线程原子性)
+        self._diag_msg_count = 0           # 收到消息总数
+        self._diag_frame_count = 0         # 去重后接受的新帧总数
+        self._diag_dedup_count = 0         # 被 frame_index 去重丢弃的消息数
+        self._diag_decode_fail_count = 0   # 解码失败消息数
+        self._diag_pause_count = 0         # 停顿(重锚定)次数
+        self._diag_last_gap_ms = 0.0       # 最近一次停顿的墙钟间隙(ms)
+        # 播放游标/窗口统计(get_obs 的 policy 线程)
+        self._diag_tick_count = 0
+        self._diag_frozen_ticks = 0        # P 未推进的 tick
+        self._diag_move_ticks = 0          # P 推进的 tick
+        self._diag_window_same_ticks = 0   # 窗口与上一 tick 位级一致的 tick
+        self._diag_collapse_ticks = 0      # 前视塌缩(缓冲仅 1 帧)的 tick
+        self._diag_frozen_streak = 0       # P 连续未推进的 tick 数
+        self._diag_resume_trace = 0        # 恢复后逐 tick 跟踪剩余步数
+        self._diag_prev_p: int | None = None
+        self._diag_prev_window: np.ndarray | None = None  # 上一 tick 窗口 joint_pos
+        self._diag_freeze_logged = False
+        self._diag_collapse_warned_at = 0.0
+        # 1Hz 摘要基线
+        self._diag_summary_t0 = time.monotonic()
+        self._diag_summary_msg0 = 0
+        self._diag_summary_frame0 = 0
 
         self._default_joint_pos, self._default_body_pos_w, self._default_body_quat_w = (
             _resolve_default_posture(self.joint_names, self.body_names, mj_model, default_qpos)
@@ -1069,12 +1102,14 @@ class RealtimeMotionBufferVla:
                     time.sleep(0.01)
                     continue
 
+                self._diag_msg_count += 1
                 try:
                     if raw and raw[:1] == b"{":
                         self._handle_json_message(raw.decode("utf-8"))
                     else:
                         self._handle_binary_message(raw)
                 except Exception as exc:  # noqa: BLE001
+                    self._diag_decode_fail_count += 1
                     logger.warning(f"RealtimeMotionBufferVla ingest error: {exc}")
 
         self._motion_stream_thread = threading.Thread(target=_stream_loop, daemon=True)
@@ -1128,6 +1163,7 @@ class RealtimeMotionBufferVla:
         with self._lock:
             ts = self._compute_anchor_ts_locked()
             self._insert_frame_locked(ts, joint_pos_frame, body_pos_w_frame, body_quat_w_frame)
+        self._diag_frame_count += 1
 
     # ------------------------------------------------------------------
     # [修改1] 二进制协议 v1 入口 + [修改2] frame_index 去重
@@ -1158,6 +1194,7 @@ class RealtimeMotionBufferVla:
         # 2 帧滑动窗口 [i-1, i]: 只取帧号 > 已见最大帧号的"新帧"
         new_rows = [int(i) for i in range(n) if frame_index[i] > self._last_frame_index]
         if not new_rows:
+            self._diag_dedup_count += 1
             return  # 全部为重叠帧 → 静默丢弃
         self._last_frame_index = int(frame_index.max())
 
@@ -1183,6 +1220,7 @@ class RealtimeMotionBufferVla:
             for j, (jp, bp, bq) in enumerate(rows):
                 ts = anchor_ns - (len(rows) - 1 - j) * self._nominal_frame_ns
                 self._insert_frame_locked(ts, jp, bp, bq)
+        self._diag_frame_count += len(rows)
 
     # ------------------------------------------------------------------
     # [修改3] 时间戳重锚定(调用方必须持有 _lock)
@@ -1191,11 +1229,30 @@ class RealtimeMotionBufferVla:
         wall = time.time_ns()
         if not self._timestamps_ns:
             anchor = 0  # 数据时间轴原点
+            if self._diag_enabled:
+                logger.info(
+                    "[RealtimeMotionBufferVla diag] 首包事件: 数据时间轴原点 ts=0 建立, "
+                    "wall={}ns",
+                    wall,
+                )
         else:
             delta = wall - self._last_arrival_wall_ns
             if delta > self._gap_threshold_ns:
                 # 检测到推理停顿: 时间轴暂停, 新帧重锚到上帧 + 名义周期
                 anchor = self._timestamps_ns[-1] + self._nominal_frame_ns
+                self._diag_pause_count += 1
+                self._diag_last_gap_ms = delta / 1e6
+                if self._diag_enabled:
+                    logger.info(
+                        "[RealtimeMotionBufferVla diag] 停顿检测+重锚定: "
+                        "墙钟间隙={:.1f}ms (>阈值{:.1f}ms), latest={}ns → anchor={}ns "
+                        "(=latest+{:d}ns, 应为名义周期 33.3ms — 验证重锚定正确性)",
+                        self._diag_last_gap_ms,
+                        self._gap_threshold_ns / 1e6,
+                        self._timestamps_ns[-1],
+                        anchor,
+                        self._nominal_frame_ns,
+                    )
             else:
                 # 正常连续流: 按到达间隔推进数据时间
                 anchor = self._timestamps_ns[-1] + delta
@@ -1392,6 +1449,139 @@ class RealtimeMotionBufferVla:
         self._align_yaw_deg = None
         self._playback_time_ns = 0
         self._playback_initialized = False
+        self._last_get_obs_wall_ns = None
+        # 诊断: 播放/窗口基准重置(避免把 clear 前后的窗口误判为"一致"或"冻结")
+        self._diag_prev_p = None
+        self._diag_prev_window = None
+        self._diag_frozen_streak = 0
+        self._diag_resume_trace = 0
+
+    # ------------------------------------------------------------------
+    # 诊断监测(联调排查; enable_diagnostics=True 时每 tick 由 get_obs 调用)
+    # ------------------------------------------------------------------
+    def _diag_record_tick(
+        self,
+        newest: int | None,
+        cap: int | None,
+        window_joint_pos: np.ndarray,
+    ) -> None:
+        """记账 + 事件日志 + 1Hz 聚合摘要。
+
+        newest/cap 为 None 表示空缓冲 tick。msg/帧计数器由 ZMQ 接收线程写入,
+        此处读取不追求跨线程原子性(仅诊断用途)。
+        """
+        self._diag_tick_count += 1
+        p = self._playback_time_ns
+        prev = self._diag_prev_p
+        frozen = prev is not None and p == prev
+        self._diag_prev_p = p
+
+        # 播放游标冻结/恢复事件: 正常流中"钉 cap"只冻 1 个 tick, VLA 推理停顿
+        # 则连续 ≥3 tick(60ms) 冻结——用 3-tick 阈值区分两者, 避免日志抖动
+        if frozen:
+            self._diag_frozen_ticks += 1
+            self._diag_frozen_streak += 1
+            if self._diag_frozen_streak == 3 and not self._diag_freeze_logged:
+                self._diag_freeze_logged = True
+                logger.info(
+                    "[RealtimeMotionBufferVla diag] 播放游标冻结(连续3 tick 未推进): "
+                    "P={}ns, newest={}ns, cap={}ns, 延迟newest-P={}ms — "
+                    "停顿期参考应位级一致(见窗口一致tick)",
+                    p,
+                    newest,
+                    cap,
+                    None if newest is None else f"{(newest - p) / 1e6:.1f}",
+                )
+        else:
+            self._diag_move_ticks += 1
+            if self._diag_frozen_streak >= 3 and self._diag_freeze_logged:
+                self._diag_freeze_logged = False
+                logger.info(
+                    "[RealtimeMotionBufferVla diag] 播放游标恢复推进: P 按墙钟实测间隔步进 "
+                    "(当前 P={}ns) — 恢复期应先扫过保留尾巴再以正常帧距插值进入新块",
+                    p,
+                )
+                self._diag_resume_trace = 6  # 恢复后逐 tick 跟踪 6 步
+            if self._diag_resume_trace > 0:
+                step_delta_ns = p - prev if prev is not None else 0
+                logger.info(
+                    "[RealtimeMotionBufferVla diag] 恢复步进 {}/6: P={}ns "
+                    "(本tick +{:.3f}ms), newest={}ns, cap={}ns, 延迟newest-P={}ms — "
+                    "若相邻两行 newest 差≈0.2~0.5ms, 即客户端块边界双发; "
+                    "若差≈33.3ms 为正常 30Hz 帧",
+                    7 - self._diag_resume_trace,
+                    p,
+                    step_delta_ns / 1e6,
+                    newest,
+                    cap,
+                    None if newest is None else f"{(newest - p) / 1e6:.1f}",
+                )
+                self._diag_resume_trace -= 1
+            self._diag_frozen_streak = 0
+
+        # 窗口位级一致性: 与上一 tick 的窗口逐元素比较,
+        # 差值=0 → "停顿期消耗相同 ref motion"得到验证
+        if self._diag_prev_window is not None:
+            if float(np.abs(window_joint_pos - self._diag_prev_window).max()) == 0.0:
+                self._diag_window_same_ticks += 1
+        self._diag_prev_window = window_joint_pos.copy()
+
+        # 前视塌缩告警(缓冲仅 1 帧 → 整个未来窗口同一姿态, 策略无前视)
+        with self._lock:
+            buffered = len(self._timestamps_ns)
+        if buffered == 1:
+            self._diag_collapse_ticks += 1
+            now_m = time.monotonic()
+            if now_m - self._diag_collapse_warned_at >= 5.0:
+                self._diag_collapse_warned_at = now_m
+                logger.warning(
+                    "[RealtimeMotionBufferVla diag] 前视塌缩: 缓冲仅 1 帧, "
+                    "未来窗口无前视(策略只能被动跟踪, 易不稳)"
+                )
+
+        # 1Hz 聚合摘要 + 收包率告警
+        now_m = time.monotonic()
+        if now_m - self._diag_summary_t0 >= 1.0:
+            dt_s = max(now_m - self._diag_summary_t0, 1e-6)
+            msg_hz = (self._diag_msg_count - self._diag_summary_msg0) / dt_s
+            frame_hz = (self._diag_frame_count - self._diag_summary_frame0) / dt_s
+            lag_ms = None if newest is None else (newest - p) / 1e6
+            logger.info(
+                "[RealtimeMotionBufferVla diag] 1s摘要: "
+                "tick={} 收包={:.1f}/s(累计{}) 新帧={:.1f}/s 去重={} 解码失败={} "
+                "停顿次数={}(最近间隙{:.1f}ms) | P={}ns 延迟newest-P={}ms stale={}ms "
+                "缓冲帧={} | 冻结tick={} 运动tick={} 窗口一致tick={} 塌缩tick={}",
+                self._diag_tick_count,
+                msg_hz,
+                self._diag_msg_count,
+                frame_hz,
+                self._diag_dedup_count,
+                self._diag_decode_fail_count,
+                self._diag_pause_count,
+                self._diag_last_gap_ms,
+                p,
+                None if lag_ms is None else f"{lag_ms:.1f}",
+                self.stale_ms(),
+                buffered,
+                self._diag_frozen_ticks,
+                self._diag_move_ticks,
+                self._diag_window_same_ticks,
+                self._diag_collapse_ticks,
+            )
+            if msg_hz < 10.0:
+                logger.warning(
+                    "[RealtimeMotionBufferVla diag] 收包率异常偏低: {:.1f}/s "
+                    "(预期 ~30/s; 检查 openpi 客户端是否在跑/网络是否中断)",
+                    msg_hz,
+                )
+            elif msg_hz > 45.0:
+                logger.warning(
+                    "[RealtimeMotionBufferVla diag] 收包率异常偏高: {:.1f}/s (预期 ~30/s)",
+                    msg_hz,
+                )
+            self._diag_summary_t0 = now_m
+            self._diag_summary_msg0 = self._diag_msg_count
+            self._diag_summary_frame0 = self._diag_frame_count
 
     # ------------------------------------------------------------------
     # [修改4/5] 数据驱动播放时钟 + 基于播放时钟的 cleanup
@@ -1406,6 +1596,7 @@ class RealtimeMotionBufferVla:
         body_ang_vel_w = np.zeros((1, num_steps, self._num_bodies, 3), dtype=np.float32)
 
         empty = False
+        cap: int | None = None
         with self._lock:
             if not self._timestamps_ns:
                 empty = True
@@ -1419,15 +1610,21 @@ class RealtimeMotionBufferVla:
             body_quat_w[:] = self._default_body_quat_w[None, None, :, :]
             target_times_ns = np.zeros((1, num_steps), dtype=np.int64)
         else:
-            # 播放时钟推进: 每 tick +dt, 被"最新帧 - delay"钳制
+            # 播放时钟推进(已修复延迟漂移): 按两次 get_obs 间的实测墙钟间隔推进,
+            # 被"最新帧 - delay"钳制。P 与数据时间轴(按到达墙钟差推进)同速率 1×,
+            # 软实时循环(49~50Hz 抖动)下延迟恒 120ms, 不再随流式期线性漂移。
+            cap = newest - self._delay_ns
             if not self._playback_initialized:
                 self._playback_time_ns = newest - self._delay_ns
                 self._playback_initialized = True
+                self._last_get_obs_wall_ns = time.monotonic_ns()
             else:
-                self._playback_time_ns += self._dt_ns
-                cap = newest - self._delay_ns  # ← VLA 停顿期 newest 冻结 → P 冻结
+                now_wall = time.monotonic_ns()
+                if self._last_get_obs_wall_ns is not None:
+                    self._playback_time_ns += now_wall - self._last_get_obs_wall_ns
+                self._last_get_obs_wall_ns = now_wall
                 if self._playback_time_ns > cap:
-                    self._playback_time_ns = cap
+                    self._playback_time_ns = cap  # "钉 cap": VLA 停顿期 P 冻结
 
             target_times_ns = (self._playback_time_ns + self._future_steps_ns).reshape(1, -1)
 
@@ -1438,6 +1635,9 @@ class RealtimeMotionBufferVla:
                 self._fill_sample_frames_locked(
                     target_times_ns[0], joint_pos[0], body_pos_w[0], body_quat_w[0]
                 )
+
+        if self._diag_enabled:
+            self._diag_record_tick(newest if not empty else None, cap, joint_pos[0])
 
         # 首帧 yaw 对齐(空->非空边沿), 与旧类同位置计算
         anchor_idx = self._anchor_index()

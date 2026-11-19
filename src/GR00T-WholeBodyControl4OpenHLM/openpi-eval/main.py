@@ -49,6 +49,16 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 
+# Per-environment default language instruction; `--instruction` overrides it.
+# The JAKA text is the task stored in the training dataset (record_teleop/README.zh-CN.md,
+# `--task` in convert_jaka_raw_to_lerobot.py), so the deployed policy is prompted with
+# exactly the instruction it was trained on.
+DEFAULT_INSTRUCTIONS = {
+    "sonic_g1": "Pick up the purple soft finger on the table and place it on the mouse pad.",
+    "jaka_tabletop_pick": "pick up the box",
+}
+
+
 @dataclasses.dataclass
 class Args:
     # Network parameters
@@ -60,8 +70,8 @@ class Args:
 
     # Evaluation parameters
     max_steps: int = 1000
-    # Fixed instruction as requested
-    instruction: str = "Pick up the purple soft finger on the table and place it on the mouse pad."
+    # Fixed instruction; None means DEFAULT_INSTRUCTIONS[env]
+    instruction: str | None = None
 
     # Control parameters
     control_hz: int = 30
@@ -275,6 +285,11 @@ def main(args: Args):
         action_dim, state_dim = 33, 30
         num_cameras = 1  # jaka has a single head camera; JakaInputs masks the wrist views
     print(f"Using env={args.env}, action_dim={action_dim}, state_dim={state_dim}")
+
+    # Resolve the prompt before the warmup request so every episode uses the same text.
+    if args.instruction is None:
+        args.instruction = DEFAULT_INSTRUCTIONS[args.env]
+    print(f"Using instruction: '{args.instruction}'")
 
     # Initialize the environment
     if args.env == "sonic_g1":

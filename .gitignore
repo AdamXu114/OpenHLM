@@ -393,3 +393,7 @@ cython_debug/
 *.o
 OrinVideoSender*
 data/*
+# HuggingFace cache used for local dataset downloads
+.hf/
+
+record_teleop/*

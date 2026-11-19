@@ -6,10 +6,15 @@ standalone LeRobot v2.1 dataset. This script concatenates them into a single
 dataset whose `repo_id` matches the `jaka_tabletop_pick` TrainConfig, so the
 training pipeline can load it via `HF_LEROBOT_HOME` without further changes.
 
-This is a direct pyarrow rewrite: the `head_image_left` column stores PNG bytes
-inline (`struct<bytes, path>`), so it is copied through byte-for-byte and never
-decoded. Only `state` / `actions` are touched, plus the bookkeeping columns
-(`index`, `episode_index`, `task_index`). `meta/info.json`, `meta/tasks.jsonl`,
+This is a pyarrow rewrite, except for the images. The recordings keep whatever
+the camera produced (480x300 for the new sessions), so every `head_image_left`
+frame is decoded, `resize_with_pad`-ed to 224x224 -- the model input resolution
+-- and re-encoded, with the same helper
+`examples/unitree_g1/convert_g1_data_to_lerobot.py` uses for the G1 dataset.
+Frames that are already 224x224 are copied through byte-for-byte, so re-merging
+an existing dataset does not touch the image bytes.
+`state` / `actions` are reordered, and the bookkeeping columns (`index`,
+`episode_index`, `task_index`) renumbered. `meta/info.json`, `meta/tasks.jsonl`,
 `meta/episodes.jsonl` and `meta/episodes_stats.jsonl` are written by this script,
 following the lerobot v2.1 conventions.
 
@@ -64,11 +69,20 @@ DEFAULT_SOURCE_DIRS = [
 # Output dataset. `OUTPUT_REPO_ID` must match `LeRobotJakaDataConfig.repo_id`
 # in src/openpi/training/config.py, and the dataset lands at
 # `$HF_LEROBOT_HOME / OUTPUT_REPO_ID`.
-DEFAULT_OUTPUT_REPO_ID = "teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0"
+DEFAULT_OUTPUT_REPO_ID = "jaka_pick"
 
 # Metadata only -- the training pipeline never reads `robot_type`; the sources
 # leave it null.
 DEFAULT_ROBOT_TYPE = "jaka"
+
+# Image column and target size. The recordings store the camera's native frame
+# (480x300 for the new sessions), so every frame is resize_with_pad'ed down to
+# this square at merge time -- the same 224x224 that
+# `examples/unitree_g1/convert_g1_data_to_lerobot.py` writes and that
+# `openpi.models.model.IMAGE_RESOLUTION` expects.
+IMAGE_KEY = "head_image_left"
+DEFAULT_IMAGE_HEIGHT = 224
+DEFAULT_IMAGE_WIDTH = 224
 
 # --- joint groups, as recorded ON DISK (MuJoCo joint order) ----------------
 
@@ -312,6 +326,92 @@ def list_column(values: np.ndarray, like: pa.DataType) -> pa.Array:
     return pa.ListArray.from_arrays(offsets, flat)
 
 
+def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Replicates tf.image.resize_with_pad for multiple images using PIL. Resizes a batch of images to a target height.
+
+    Args:
+        images: A batch of images in [..., height, width, channel] format.
+        height: The target height of the image.
+        width: The target width of the image.
+        method: The interpolation method to use. Default is bilinear.
+
+    Returns:
+        The resized images in [..., height, width, channel].
+    """
+    # If the images are already the correct size, return them as is.
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
+def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> np.ndarray:
+    """Replicates tf.image.resize_with_pad for one image using PIL. Resizes an image to a target height and
+    width without distortion by padding with zeros.
+
+    Unlike the jax version, note that PIL uses [width, height, channel] ordering instead of [batch, h, w, c].
+    """
+    cur_width, cur_height = image.size
+    if cur_width == width and cur_height == height:
+        return np.array(image)  # No need to resize if the image is already the correct size.
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_image = image.resize((resized_width, resized_height), resample=method)
+
+    zero_image = Image.new(resized_image.mode, (width, height), 0)
+    pad_height = max(0, int((height - resized_height) / 2))
+    pad_width = max(0, int((width - resized_width) / 2))
+    zero_image.paste(resized_image, (pad_width, pad_height))
+    assert zero_image.size == (width, height)
+    return np.array(zero_image)
+
+
+def resize_image_column(table: pa.Table, height: int, width: int) -> tuple[pa.Table, list[bytes]]:
+    """Rewrite `head_image_left` with every frame resized to (height, width).
+
+    Each frame is decoded from its inline PNG bytes, run through
+    `resize_with_pad` (aspect ratio preserved, zero-padded) and re-encoded as an
+    RGB PNG. Frames that already have the target size keep their original bytes,
+    so re-merging an existing 224x224 dataset is a no-op for the images. The
+    `path` sub-field of the struct (a lerobot bookkeeping string) is kept as is.
+
+    Returns the rewritten table and the PNG bytes of every frame in row order,
+    so the caller can compute the image stats from exactly what lands on disk.
+    """
+    column = table.column(IMAGE_KEY).combine_chunks()
+    resized_pngs: list[bytes] = []
+    for png in column.field("bytes").to_pylist():
+        with Image.open(io.BytesIO(png)) as img:
+            if img.size == (width, height) and img.mode == "RGB":
+                resized_pngs.append(png)  # already at the target size, keep the original bytes
+                continue
+            pixels = np.asarray(img.convert("RGB"), dtype=np.uint8)
+        resized = resize_with_pad(pixels, height, width)
+        buffer = io.BytesIO()
+        Image.fromarray(resized).save(buffer, format="PNG")
+        resized_pngs.append(buffer.getvalue())
+
+    struct_type = table.schema.field(IMAGE_KEY).type
+    fields = [struct_type.field(i) for i in range(struct_type.num_fields)]
+    arrays = [
+        pa.array(resized_pngs, type=struct_type.field("bytes").type)
+        if field.name == "bytes"
+        else column.field(field.name)
+        for field in fields
+    ]
+    field = table.schema.field(IMAGE_KEY)
+    table = table.set_column(
+        table.schema.get_field_index(IMAGE_KEY), field, pa.StructArray.from_arrays(arrays, fields=fields)
+    )
+    return table, resized_pngs
+
+
 def rewrite_episode(table: pa.Table, out_episode: int, frame_offset: int, task_index: int) -> pa.Table:
     """Renumber the bookkeeping columns of one episode (index / episode_index / task_index)."""
     schema = table.schema
@@ -335,6 +435,8 @@ def write_meta(
     episodes: list[dict],
     tasks: list[str],
     episodes_stats: list[dict],
+    image_height: int,
+    image_width: int,
 ) -> None:
     meta_dir = out_path / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +458,9 @@ def write_meta(
     )
     info["features"]["state"]["names"] = state_names
     info["features"]["actions"]["names"] = action_names
+    # The stored images are always resized to the target size, whatever the
+    # sources declared (they carry the camera's native resolution).
+    info["features"][IMAGE_KEY]["shape"] = [image_height, image_width, 3]
 
     with (meta_dir / "info.json").open("w") as f:
         json.dump(info, f, indent=4, ensure_ascii=False)
@@ -393,6 +498,8 @@ def main(args: Args) -> None:
     state_names = SOURCE_STATE_NAMES if args.identity else SAVED_STATE_NAMES
     action_names = state_names + tail_names
     chunks_size = ref_info["chunks_size"]
+    image_height = DEFAULT_IMAGE_HEIGHT
+    image_width = DEFAULT_IMAGE_WIDTH
 
     print(f"Sources     : {len(source_dirs)}")
     for session_dir in source_dirs:
@@ -401,6 +508,10 @@ def main(args: Args) -> None:
     print(f"Output      : {out_path}")
     print(f"State dims  : {len(state_names)}")
     print(f"Action dims : {len(action_names)}  (last {len(tail_names)} are anchor dims, never reordered)")
+    print(
+        f"Images      : {IMAGE_KEY} {ref_info['features'][IMAGE_KEY]['shape']} "
+        f"-> {image_height}x{image_width} (resize_with_pad)"
+    )
     print("\nSaved state order:")
     for i, name in enumerate(state_names):
         origin = SOURCE_STATE_NAMES.index(name)
@@ -456,6 +567,9 @@ def main(args: Args) -> None:
             for name, values in (("state", new_state), ("actions", new_actions)):
                 field = table.schema.field(name)
                 table = table.set_column(table.schema.get_field_index(name), field, list_column(values, field.type))
+            # The recordings keep the camera's native frame size; training wants
+            # the model resolution, padded rather than stretched.
+            table, image_bytes = resize_image_column(table, image_height, image_width)
             table = rewrite_episode(table, out_episode, frame_offset, tasks.index(task))
             # Keep the source's `huggingface` schema metadata (it records only
             # dtypes/shapes, not joint names, so it stays valid).
@@ -473,16 +587,25 @@ def main(args: Args) -> None:
                     "stats": {
                         "state": to_jsonable(feature_stats(new_state)),
                         "actions": to_jsonable(feature_stats(new_actions)),
-                        "head_image_left": to_jsonable(
-                            image_stats([cell["bytes"].as_py() for cell in table.column("head_image_left")])
-                        ),
+                        # Stats over the bytes written above, i.e. the resized
+                        # frames, not the raw recordings.
+                        IMAGE_KEY: to_jsonable(image_stats(image_bytes)),
                     },
                 }
             )
             frame_offset += table.num_rows
 
     write_meta(
-        out_path, ref_info, state_names, action_names, args.robot_type, episodes, tasks, episodes_stats
+        out_path,
+        ref_info,
+        state_names,
+        action_names,
+        args.robot_type,
+        episodes,
+        tasks,
+        episodes_stats,
+        image_height,
+        image_width,
     )
 
     print(f"\nWrote {len(episodes)} episodes / {frame_offset} frames to {out_path}")

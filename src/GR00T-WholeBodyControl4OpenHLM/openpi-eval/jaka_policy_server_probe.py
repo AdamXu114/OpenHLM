@@ -49,7 +49,8 @@ import tyro
 import websockets.sync.client
 from openpi_client import msgpack_numpy
 
-DEPLOY_PROMPT = "Pick up the purple soft finger on the table and place it on the mouse pad."
+# Must match the task stored in the JAKA training dataset and main.py's JAKA default.
+DEPLOY_PROMPT = "pick up the box"
 
 
 @dataclasses.dataclass
