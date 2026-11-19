@@ -101,13 +101,13 @@ class Args:
     jaka_state_port: int = 28711
     jaka_head_image_address: str = "127.0.0.1"
     jaka_head_image_port: int = 28712
-    # Anchor (waist_yaw_Link) initial pose; the yaw component is only a seed, it then
+    # Anchor (base_link) initial pose; the yaw component is only a seed, it then
     # accumulates yaw_vel. z feeds the tracker's absolute root_z_mf, so it defaults to
-    # the recorded standing waist height (~0.83 m); x/y are an arbitrary origin
-    # (root_pos_diff_b is translation-invariant). The dataset means are
-    # (12.53212, 4.91023, 0.82769) for the position and
-    # (0.80923, 0.01067, 0.01590, -0.05691) for the wxyz quaternion.
-    jaka_initial_anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.83)
+    # the recorded BASE height (~0.604 m, i.e. NOT the 0.22385 m higher waist); x/y are
+    # an arbitrary origin (root_pos_diff_b is translation-invariant). The dataset means
+    # are (0.27934, -0.95991, 0.60442) for the position and
+    # (0.62867, 0.02642, -0.00725, 0.76849) for the wxyz quaternion.
+    jaka_initial_anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.604)
     jaka_initial_anchor_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)  # radians
 
     # Visualization

@@ -15,7 +15,7 @@ Action layout produced by ``JakaOutputs`` (policy order, arms first)::
     27-29  anchor: roll (absolute), pitch (absolute), yaw_vel (angular velocity)
     30-32  anchor_lin_vel x/y/z -- **in the ANCHOR BODY FRAME**, not world
 
-The anchor fields describe the reference anchor (``waist_yaw_Link`` -- the body the
+The anchor fields describe the reference anchor (``base_link`` -- the body the
 tracker's ``root_pos_diff_b`` / ``anchor_ori`` are built around), which is also the
 frame the reference joints are commanded in. The world pose is not carried on the
 wire: it is re-integrated here from the per-frame velocity + orientation, exactly as
@@ -34,7 +34,7 @@ its interval, so the quat is built from the accumulated yaw **before** this fram
 The downstream reference buffer (``RealtimeMotionBufferVla``, from
 ``implement_action_analysis/src/simple/jaka_rl/motion_buffer.py``) subscribes to
 binary protocol v1 over ZMQ and expects the 27 joints in MuJoCo/SIM order (legs
-first), the anchor (``waist_yaw_Link``) world pose, and a strictly monotonic
+first), the anchor (``base_link``) world pose, and a strictly monotonic
 ``frame_index`` -- see ``implementation_analysis.md`` section 5.3.
 """
 
@@ -154,18 +154,20 @@ DEFAULT_STATE_JAKA = np.array([
      0.0044,  0.0277, -0.0065,                               # root roll/pitch, yaw_vel
 ], dtype=np.float32)
 
-# Dataset means, for reference when overriding --jaka-initial-anchor-*:
-#   anchor_pos_w  (12.53212, 4.91023, 0.82769)  [pico/GMR world of the recording]
-#   anchor_quat_w (0.80923, 0.01067, 0.01590, -0.05691)
+# Dataset means, for reference when overriding --jaka-initial-anchor-* (new 40-episode
+# `jaka_pick` set, anchor = base_link):
+#   anchor_pos_w  (0.27934, -0.95991, 0.60442)
+#   anchor_quat_w (0.62867, 0.02642, -0.00725, 0.76849)
 # x/y are arbitrary: the tracker's ``root_pos_diff_b`` is built from anchor position
 # *differences*, so the whole trajectory is translation-invariant in x/y. z is NOT --
 # ``root_z_mf`` reads the anchor's ABSOLUTE world z -- so the default replicates the
-# recorded anchor height (~0.83 m, the standing waist height) rather than 0, which
-# would command a 0.83 m drop. The receiver's own empty-buffer fallback posture puts
-# the anchor at ~0.874 (motion_buffer.py `_init_default_posture`).
+# recorded BASE height (0.604 m; recorded z spans 0.587-0.614, first frames 0.608)
+# rather than 0, which would command a 0.6 m drop. The downstream anchor is base_link:
+# do NOT add the old waist offset (waist_yaw_Link sits 0.22385 m above base_link), or
+# the reference would sit at ~0.83 m and be ~0.22 m too high.
 # The yaw seed only sets the heading offset: the receiver re-aligns the reference yaw
-# to the live robot on its first frame (`align_quat`, motion_buffer.py:327).
-DEFAULT_INITIAL_ANCHOR_POS = (0.0, 0.0, 0.83)
+# to the live robot on its first frame (`align_quat`).
+DEFAULT_INITIAL_ANCHOR_POS = (0.0, 0.0, 0.604)
 DEFAULT_INITIAL_ANCHOR_RPY = (0.0, 0.0, 0.0)
 
 
@@ -206,7 +208,7 @@ class JakaTabletopEnv:
                 image. Defaults to SIMPLE's ``camera_zmq_bind`` (28712).
             num_frames_to_send: Frames buffered per ZMQ message (2 = sliding
                 window ``[i-1, i]``, matching the receiver's dedup contract).
-            initial_anchor_pos: Anchor (``waist_yaw_Link``) initial world position.
+            initial_anchor_pos: Anchor (``base_link``) initial world position.
                 Only z is semantically load-bearing (it is the tracker's absolute
                 ``root_z_mf``); x/y merely fix an arbitrary translation origin.
             initial_anchor_rpy: Anchor initial roll/pitch/yaw in radians (only the

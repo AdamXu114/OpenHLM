@@ -307,7 +307,7 @@ def test_live_stream():
     from scipy.spatial.transform import Rotation
 
     accel = np.array([0.1, 0.2, 0.3], dtype=np.float64)
-    expected_pos = {0: np.array([0.0, 0.0, 0.83])}  # DEFAULT_INITIAL_ANCHOR_POS
+    expected_pos = {0: np.array([0.0, 0.0, 0.604])}  # DEFAULT_INITIAL_ANCHOR_POS
     for k in range(1, n_steps + 1):
         expected_pos[k] = expected_pos[k - 1] + Rotation.from_euler(
             "xyz", [0.1, 0.2, 0.3 * dt * (k - 1)]).apply(accel) * dt

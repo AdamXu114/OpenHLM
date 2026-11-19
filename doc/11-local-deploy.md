@@ -144,11 +144,10 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 
 ## 7. 已知问题（部署前必读）
 
-1. **anchor 帧残差**：新数据集的 anchor body 是 `base_link`（旧数据是 `waist_yaw_Link`），
-   当前部署端把发布的位姿按 `waist_yaw_Link` 解释，靠初始 z=0.83 抵消了 0.22385 m 的
-   高度差，但还残留 **位置 ≤2 cm、朝向 ≤7°**（正好等于 `waist_yaw_joint` 角）。
-   `env.step` 的速度积分本身没有错（forward/nominal 标签与其严格互逆），
-   需要改的是「发布前补一步 base→waist FK」，方案已讨论过，尚未实施。
+1. **anchor 帧**：数据集与下游已统一为 `base_link`，本机默认初始 z 取 **0.604**
+   （记录 base 高度均值；实测范围 0.587–0.614，每集首帧 0.608 ± 0.003）。
+   **不要**再用旧 waist 的 0.83 —— 它比 base 高 0.22385 m，会让参考整体抬高 0.22 m。
+   旧 `jaka_tabletop_pick_v1` 是 waist 标签训练的，不要在新下游上部署。
 2. **prompt**：训练/部署必须同为 `pick up the box`。
 3. **`PYTHONPATH`**：`main.py` 依赖 `src/GR00T-WholeBodyControl4OpenHLM` 在 `PYTHONPATH` 里。
 4. **opencv**：无 X display 时 `cv2.imshow` 会 abort，加 `--no-opencv-visualize`。

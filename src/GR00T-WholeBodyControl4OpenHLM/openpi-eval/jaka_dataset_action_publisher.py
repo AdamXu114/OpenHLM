@@ -169,9 +169,10 @@ class Args:
     num_frames_to_send: int = 2       # 2 = sliding window [i-1, i]
 
     # Defaults are main.py's deployment defaults, so the published poses sit in the same
-    # frame production uses. --anchor-from-dataset instead reproduces the recording's own
-    # absolute origin (its yaw is ~88 deg at the start of ep0, not 0).
-    anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.83)
+    # frame production uses: anchor = base_link, z = recorded base height (~0.604 m, not
+    # the 0.22385 m higher waist). --anchor-from-dataset instead reproduces the
+    # recording's own absolute origin (its yaw is arbitrary; x/y do not matter).
+    anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.604)
     anchor_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
     anchor_from_dataset: bool = False
 
