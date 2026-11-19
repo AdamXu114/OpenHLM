@@ -397,3 +397,5 @@ data/*
 .hf/
 
 record_teleop/*
+*.tar.gz
+logs/
