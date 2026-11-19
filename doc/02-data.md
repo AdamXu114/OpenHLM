@@ -85,7 +85,11 @@ cd /workspace/OpenHLM/src/openpi4OpenHLM
 | `--dry-run` | 只打印不写盘 |
 | `--overwrite` | 输出已存在时删除重建 |
 
-脚本是 **pyarrow 直接改写**：`head_image_left` 列里是 PNG 字节（`struct<bytes, path>`），按字节整段拷贝，不解码；只动 `state` / `actions` 和记账列（`index` / `episode_index` / `task_index`）。
+脚本是 **pyarrow 改写**：`state` / `actions` 重排、记账列（`index` / `episode_index` / `task_index`）重编号；`head_image_left`（PNG 字节，`struct<bytes, path>`）会**逐帧解码 → `resize_with_pad` 到 224×224 → 重新编码**，因为录制存的是相机原始尺寸（新 session 为 480×300）。
+
+> 图像缩放在合并这步做：`resize_with_pad()` / `_resize_with_pad_pil()` 两个 helper 直接从
+> `examples/unitree_g1/convert_g1_data_to_lerobot.py` 抄过来，语义和模型里 `models/model.py`
+> 的 jax 版一致（等比缩放 + 四周补黑，不拉伸）。已经是 224×224 的帧按字节原样拷贝、不重编码，所以重跑合并不会改动老数据的图像字节。`meta/info.json` 里 `head_image_left.shape` 一律写成 `[224, 224, 3]`，与 `openpi.models.model.IMAGE_RESOLUTION` 对齐。相机以后换分辨率（比如 480×300、640×480）**不用改这里**，照录即可。
 
 历史数据（2026-09-15 三个 session）：3 + 5 + 39 = **47 episodes / 11657 frames**。
 

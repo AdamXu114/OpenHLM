@@ -1,5 +1,12 @@
 # Implementation Analysis: SIMPLE-jaka-main VLA 部署参考轨迹缓冲改造
 
+> **同步说明（2026-11-07）**：本文与 `src/simple/jaka_rl/{motion_buffer,state_processor,__init__}.py`
+> 已从本机 `../SIMPLE-jaka`（commit `d581fc5`）同步，是比仓库旧快照更新的版本。
+> 文中 `src/simple/...`、`data/jaka_mf/...` 等路径按 **SIMPLE 仓库根目录**书写；
+> 本仓库内的快照位于 `implement_action_analysis/src/simple/`，不是可直接运行的包
+> （缺 `config.py` / `math.py` / `motion.py` 等同级模块）。
+
+
 > 本文档面向后续接手的 code agent：说明本次在 `src/SIMPLE-jaka-main/` 中做的全部修改、
 > 修改动机、对应的 sonic 端（GR00T-WholeBodyControl4OpenHLM）设计哲学、接口契约与
 > 调试/排查指南。阅读本文后可无缝继续修改、完善与 bug 排查。
@@ -105,9 +112,17 @@ C++ 版 5 项核心修改（Python 版逐条对应，见第 4 节）：
 | `src/simple/jaka_rl/motion_buffer.py` | 新增 `RealtimeMotionBufferVla` 类（约 500 行）+ 模块级 `_resolve_default_posture` / `_decode_binary_v1` 辅助函数；`__all__` 增加导出。**旧 `RealtimeMotionBuffer` 类零改动** | 纯新增 |
 | `src/simple/jaka_rl/state_processor.py` | ① import 新类；② `motion_buffer` 类型注解改为 union；③ `_init_motion_backend` 新增 `motion_backend == "zmq_vla"` 分支（实例化新类）；④ `_update_motion_data` 分支改为 `in ("zmq", "zmq_vla")` | 新增后端 |
 | `src/simple/jaka_rl/__init__.py` | 导出 `RealtimeMotionBufferVla` | 导出 |
+| `src/simple/jaka_rl/base_policy.py` | ⑤ `motion_backend` 的 `Literal` 加 `"zmq_vla"`；⑥ `prepare_policy_config` 的注入分支 `if mb == "zmq":` → `if mb in ("zmq", "zmq_vla"):` | **打通链路的关键**（见 5.2） |
+| `data/jaka_mf/teleop_jaka_mf.yaml` | `motion_backend: zmq` → `zmq_vla`（改回 `zmq` 即恢复 pico 遥操作） | 配置切换 |
+
+⑤⑥ 是 2026-09-19 补的：在此之前 `zmq_vla` 虽然能构造出 buffer，但
+`prepare_policy_config` 只对 `"zmq"` 注入 ZMQ 连接/频率参数，于是走 `zmq_vla` 时
+**teleop 配置里的 `motion_zmq_connect` 被静默忽略**（永远连 `state_processor` 里
+硬编码的 28701），且 `motion_dt_s` 停在默认 `0.02`——`rl_rate = 50` 时刚好相等所以看不
+出问题，一旦 `rl_rate ≠ 50` 就退化成 6.3 陷阱 1 的延迟无界增长。
 
 **未修改**：`observations/jaka_mf.py`（消费接口完全兼容，见 5.1）、旧类 `RealtimeMotionBuffer`、
-`cli/teleop_jaka_mf.py`（通过新增兼容属性适配，见 4.6）。
+`cli/teleop_jaka_mf.py`（通过新增兼容属性适配，见 4.6；`zmq_vla` 下无需改动）。
 
 ### 4.2 类设计决策（已与需求方逐项确认）
 
@@ -252,6 +267,92 @@ elif motion_backend == "zmq_vla":
 → `self.motion_data = self.motion_buffer.get_obs()`（`_using_zmq_replay()` 恒 False，
 npz replay 回退只属于旧 "zmq" 路径，`zmq_vla` 空流即默认站姿）。
 
+### 4.7 怎么测（本机仿真，无需 VLA 服务器 / 机器人）
+
+默认数据源是 **`data/simple/JakaTabletopPickTeleop-v0/level-0`**（47 集真录数据，
+3.4~18.7 s；即 VLA 训练用的那份规范数据集）。两个终端：
+
+```bash
+# 终端 B —— 被测的接收端（motion_backend 已设为 zmq_vla），先起来
+python -m simple.cli.teleop_jaka_mf simple/JakaTabletopPickTeleop-v0 \
+    --headless --controller keyboard --debug-log /tmp/vla.jsonl
+#   等到打印 [zmq] state … Hz（约 13 s）
+
+# 终端 A —— 仿真 openpi-eval 下发（默认就是上面那份数据集）
+python scripts/test_vla_motion_stream.py --episode 0
+```
+
+**顺序很重要**：ZMQ PUB 不缓存，订阅者没连上前发的消息直接丢弃，而 teleop 启动到进控制
+循环要 ~13 s——一段 6 s 的数据在它连上前就发完了。所以要**先 B 后 A**；想反过来就先开 A
+并加 `--loop`。
+
+脚本本身只做一件事：**把录制数据按 openpi-eval 的下发模式发到 :28701**。
+`--debug-log` 的 JSONL（`ref_joint` / `joint_qpos` / `base_pos` …）就是对账接收端的入口。
+
+延时/异常场景的旋钮：`--inference-ms`（推理停顿，默认 120）、`--inference-jitter-ms`、
+`--drop-every`（丢帧）、`--final-stall-s`（VLA 挂掉、彻底停发）、`--loop`、
+`--hold-s`（数据放完后保持末帧多久）、`--anchor-source integrated`（复现 openpi-eval
+的积分路径）。
+
+⚠️ **`[send]` 显示 ~27 Hz 而不是 30 Hz 是正常的**，不是丢帧：`control_hz` 是"非推理拍"的
+节拍，而每 25 帧里有 1 拍要阻塞推理时间，那张单子算进帧率里 ——
+`25 / (24×33.3ms + 120ms) ≈ 27.2 Hz`。`openpi-eval` 的循环结构完全相同（推理拍那次
+`env.step()` 花掉 120ms+ 之后 `elapsed > target_dt`，不再补 sleep），所以**真机也到不了
+30 Hz**。每次运行结束脚本会打印这个上限。它同时意味着**参考被放慢约 9%**
+（27.2/30）——见第 7 节 TODO。
+
+#### 用**真的** OpenHLM env 当发送端
+
+上面的 `test_vla_motion_stream.py` 是按 openpi-eval 逻辑**复刻**的发送端（便于在本机无
+OpenHLM 依赖时跑）。要验证**真代码**，可以直接用本目录的 `jaka_tabletop_env.py`：它的
+`step()` 就是那条打包路径，喂录制的 33 维 action 即可（规范集的 `actions[:, 0:33]` 正好
+就是它要的策略序 action）：
+
+```python
+from jaka_tabletop_env import JakaTabletopEnv
+env = JakaTabletopEnv(mock=False, publish=True, control_hz=30)   # PUB :28701
+env.step(actions33[i])                                            # 逐帧下发
+```
+
+2026-09-19 实测（199 帧 / 6.6 s，与 4.7 同样的两终端跑法，只是发送端换成真 env）：
+
+| 检查项 | 真 `JakaTabletopEnv` | 复刻发送端 |
+|---|---|---|
+| 参考链路 ref→录制轨迹 | mean **0.0170** / p95 0.056 rad | 0.0162 / 0.048 rad |
+| 闭环相关系数 | mean 0.70 | 0.73 |
+| 稳定性 | base z 0.596 → 0.562，**站住** | 站住 |
+| 接收端错误 | 0（无 `decode failed` / `dim mismatch`）| 0 |
+
+两条路径的数字一致 ⇒ 复刻发送端是忠实的，真 env 的线格式也确实被接收端接受。
+（观测通道同样验过：`get_observation()` 从 SIMPLE 的 :28711/:28712 取到
+`(30,) float32` 状态与 `(224,224,3) uint8` 真图，非全零/非全黑。）
+
+### 4.8 端到端验证记录（2026-09-19，本机仿真）
+
+按 4.7 的两终端跑法，`data/simple/JakaTabletopPickTeleop-v0/level-0` episode 0
+（199 帧 / 6.6 s）：
+
+| 检查项 | 结果 |
+|---|---|
+| buffer 构造 / 协议解析 | `default standing posture via MuJoCo FK`；无 `binary decode failed` / `dim mismatch` |
+| 控制循环 | 45.4–49.5 Hz，无异常掉帧 |
+| **参考链路正确性** | teleop 实际用的 `ref_joint` vs 录制轨迹：mean **0.016 rad**、p95 0.048 rad |
+| 闭环跟踪 | 25 个活动关节 ref-vs-robot 相关系数 mean **0.73**；关节误差 mean 0.60 rad |
+| 稳定性 | base z 0.596 → min 0.555，**站住了** |
+| 时序不变量 † | `newest - P` 下界恒 120.0 ms，锯齿上包络跨停顿不抬高；停顿冻结 100 ms（推理 120 ms）|
+| 停顿一致性 † | 参考帧推进 0.47 帧/拍，理论 0.63——差额正好由 14 次停顿（每次 ~5 拍不推进）解释 |
+
+† 这两行（以及 6.3 陷阱 1 的读数）是当时用脚本里一个**进程内监视器**（按 50 Hz 调
+`get_obs()` 并统计）量的。那个监视器 2026-09-19 已从脚本中移除——脚本现在只做下发，
+这些指标要复现得另写探针。其余各行都来自 `--debug-log` 的 JSONL，随时可复现。
+
+同一套跑法在 `data/teleop_jaka_mf/20260915-145329`（旧格式数据集，163 帧 / 5.4 s）上
+也通过：参考链路 mean 0.018 rad、相关系数 mean 0.65、关节误差 0.70 rad、站住。
+
+⚠️ 闭环跟踪误差 0.6~0.7 rad 偏大，但**没有 pico 路径的基线可比**，无法区分是策略本身在
+该场景的跟踪水平还是 VLA 链路引入的——要定位需用 `scripts/fake_pico_motion_pub.py`
+回放同一条 motion 跑对照。
+
 ---
 
 ## 5. 接口契约（后续 agent 必须遵守）
@@ -275,24 +376,72 @@ align_quat     (1, 4)  首帧 yaw 对齐结果(空→非空边沿重算)
 `motion_data.body_quat_w[0,:,anchor_idx]`、`motion_data.joint_pos[0][:, self._motion_joint_indices]`
 （obs 侧再做 SIM→IsaacLab 重排）、`motion_data.align_quat`。**任何修改不得破坏这些键/形状。**
 
-### 5.2 配置契约（`data/jaka_mf/teleop_jaka_mf.yaml` 的 `motion:` 段）
+### 5.2 配置契约
+
+**开关在 `data/jaka_mf/teleop_jaka_mf.yaml`（平铺键，不是 `motion:` 段）**：
+
+```yaml
+motion_backend: zmq_vla                        # 部署用；改回 zmq 即恢复 pico 遥操作
+motion_zmq_connect: tcp://127.0.0.1:28701      # 经 prepare_policy_config 注入（见下）
+```
+
+链路是：`teleop yaml` → `JakaMFAgent(motion_backend=..., motion_zmq_connect=...)`
+→ `BasePolicyArgs` → `BasePolicy.prepare_policy_config` 把它写进
+`policy_config["motion"]` → `StateProcessor._init_motion_backend` 读取。
+
+⚠️ **`prepare_policy_config` 只对 `"zmq"` 与 `"zmq_vla"` 注入**（4.1 的 ⑤⑥）；不注入时
+下面这些键会退到 `state_processor` 里 `.get(..., 默认值)` 的硬编码值：`motion_zmq_connect`
+→ `tcp://127.0.0.1:28701`、`motion_zmq_hwm` → `1`、`motion_dt_s` → `0.02`、
+`motion_tolerance_s` → `0.04`。
+
+注入的是这四个；另外两个 VLA 专属键**没有 CLI 入口**，只能用默认值，或直接写进
+**policy yaml 的 `motion:` 段**（那才是 `StateProcessor` 真正读的字典）：
 
 ```yaml
 motion:
-  motion_backend: zmq_vla            # 新后端(旧 "zmq" 仍指向旧类, pico 遥操作不变)
-  motion_zmq_connect: "tcp://127.0.0.1:28701"   # 沿用, 双协议自动识别
-  motion_dt_s: 0.02                  # 沿用
-  motion_tolerance_s: 0.04           # 沿用
-  motion_nominal_frame_s: 0.0333     # 可选, 默认 1/30
+  motion_nominal_frame_s: 0.0333     # 可选, 默认 1/30（= openpi-eval 的 control_hz）
   motion_gap_threshold_s: 0.05       # 可选, 默认 0.05
 ```
 
 ### 5.3 上游（openpi-eval 客户端）契约
 
+**动作流（openpi-eval → SIMPLE，:28701）**
+
 - 30 Hz 下发，二进制 v1，2 帧滑动窗口 `[i-1, i]`（frame_index 单调递增、跨动作块连续）；
 - `joint_pos` 27 维 **SIM/JAKA 序**；`body_pos_w (N,3)` / `body_quat_w (N,4) wxyz` 为
   **anchor（waist_yaw_Link）** 位姿；
 - 字段名/形状不符时新类打 warning 丢弃（不崩溃），但策略将拿不到参考——排查时先看该日志。
+
+**观测流（SIMPLE → openpi-eval，:28711 / :28712）**
+
+eval 端的 `JakaTabletopEnv.get_observation()` 直接订阅 SIMPLE 的
+`JakaTeleopZmqPublisher`（`jaka_zmq_pub.py`）——**不是**另起一套，两边端口/编码已对齐
+（2026-09-19；原先 eval 侧写的是占位的 28702/28703 + msgpack + topic 前缀，没有发布端）：
+
+| 通道 | 端口 | 编码 | 内容 |
+|---|---|---|---|
+| state | **28711**（`state_zmq_bind`）| **裸 JSON**，无 topic 前缀 | `publish_t_ns` / `smplx_t_ns` / `paused` / `seq` / `joint_pos`(27, **JAKA/MuJoCo 序**) / `body_pos_w` / `body_quat_w` / `qpos` |
+| camera | **28712**（`camera_zmq_bind`）| **裸字节**，无 topic 前缀 | `struct.pack("iii", w, h, c)` + HWC uint8 **RGB** |
+
+两个 socket 都用 `SUBSCRIBE b""` + `CONFLATE=1`（发布端是 latest-only，慢消费者要丢旧帧
+而不是排队）。eval 侧由 payload 现场派生两个量：
+
+- `state[27:30]` = `roll, pitch` 取 **`body_quat_w[0]`（`base_link`）** 的 scipy 外旋 xyz；
+  `yaw_vel` = 绕世界 z 的原始角速率（包裹差分 / `publish_t_ns` 间隔，首帧为 0）——
+  与录制端 `OpenHLMRootVel` 同款算法；
+- `state[0:27]` = `joint_pos` 按 `PERM_SIM_TO_POLICY` 重排到策略序（eval 侧做，SIMPLE 发的是 JAKA 序）。
+
+⚠️ 改 `data/jaka_mf/teleop_jaka_mf.yaml` 的 `state_zmq_bind` / `camera_zmq_bind` 时，
+eval 侧 `main.py` 的 `jaka_state_port` / `jaka_head_image_port` 要同步改。
+
+### 5.4 上游代码位置
+
+真正在用的 OpenHLM 侧代码（**要同步到部署机的那两份**）也放在本目录下：
+
+| 文件 | 角色 |
+|---|---|
+| `docs/openhlm_vla/main.py` | eval 主循环，`--env {sonic_g1, jaka_tabletop_pick}` 二选一；Jaka 走 33 维 action / 30 维 state / 单目 |
+| `docs/openhlm_vla/jaka_tabletop_env.py` | Jaka 部署环境：动作打包上 PUB :28701，观测从 :28711/:28712 取 |
 
 ---
 
@@ -323,6 +472,22 @@ motion:
 1. **`get_obs()` 调用频率 = 播放时钟速率**：`P += _dt_ns` 每调用一次。若将来改动让
    `get_obs()` 每 tick 被调用多次（如诊断轮询），P 会加速冲到 cap——诊断读取请用
    `playback_time_ns()` 只读接口，不要重复调 `get_obs()`。
+
+   同一个假设还有一个**更隐蔽的失败面：调用频率必须等于 `1/dt_s`**，也就是控制循环
+   真的跑满 `rl_rate`。`P` 每次**固定**推进 `dt_s`，而数据按真实帧率到达；循环一旦
+   跑慢，`P` 就追不上 `newest`，`newest - P` **无界增长**（cleanup 基于 `P`，缓冲随之
+   膨胀），参考越播越滞后，且**全程没有任何日志**。实测
+   （2026-09-19 用 `scripts/test_vla_motion_stream.py` 实测；该脚本一度带过一个进程内
+   监视器来量这些数字，现已移除，下面的读数是历史记录）：
+
+   | 条件 | `newest - P` 稳态区间 |
+   |---|---|
+   | 47 Hz 循环 + `dt_s = 0.02` | 120 → **232 ms 且持续爬升** |
+   | 47 Hz 循环 + `dt_s = 1/47` | 120 → 161 ms（正常锯齿） |
+
+   而 `teleop_jaka_mf` 无头模式实测只跑到 **45.4–49.5 Hz**（从不到 50），即长期处在
+   第一行。按 47/50 估算延迟每秒涨约 60 ms——跑 5 分钟就滞后 ~18 s。
+   排查时盯 `newest - P` 锯齿的**上包络是否逐段抬高**（不抬高才是稳态）。
 2. **clear() 不重置 `_last_frame_index`**：客户端帧号单调，重置会导致旧帧被当作新帧
    重复插入（时间戳乱序）。若要支持"客户端重启帧号归零"，需在 clear 时同步重置
    `_last_frame_index = -1`（并接受乱序插入的 bisect 路径）。
@@ -332,6 +497,41 @@ motion:
    必须通过 `playback_time_ns()` 并自担同步。
 5. **`timestamps_ns` 是数据时间轴**：`MotionData.timestamps_ns` 已不是墙钟，任何把它
    与 `time.time_ns()` 混用的下游逻辑都会出错（当前下游无此用法）。
+6. **⚠️ 两份数据集的 `actions[0:27]` 关节序不一样**，喂参考时**按名字判、别按位置猜**：
+
+   | 数据集 | `actions[0:27]` 顺序 | 与什么一致 |
+   |---|---|---|
+   | `data/simple/JakaTabletopPickTeleop-v0/level-0`（**处理后的规范集，直接喂 VLA 训练**）| **OpenPI 策略序**（手臂在前）| **就是 VLA 的输出空间**；= `jaka_tabletop_env.POLICY_JOINT_NAMES` |
+   | `data/teleop_jaka_mf/<run>/level-0`（`record_jaka_zmq` 直出）| **JAKA/MuJoCo 序**（腿在前）| = `simple.jaka_rl.config.JOINT_NAMES` |
+
+   依据是各自 `meta/info.json` 的 `features.actions.names`。**搞错不会报任何错**——只是
+   27 个参考关节整体错位，机器人会直接摔倒（实测：错误序下关节误差 8.58 rad、base z
+   掉到 0.128 摔倒；修正后 0.60 rad、站住）。`test_vla_motion_stream.py` 因此按
+   `meta/info.json` 按名字判定并在启动时打印 `[data] actions 关节序: …`；
+   **接别的数据源时先看这一行**。
+   （注：`config.POLICY_JOINT_NAMES` 是 IsaacLab/npz 序（左右腿交替），与上面两种**都不同**，
+   只是重名——它对应 `NPZ_JOINT_NAMES`，不要拿来当"策略序"用。）
+
+7. **规范集的 33 维 action 就是 `actions[:, 0:33]` 原样**（承陷阱 6）。既然那份数据是
+   VLA 的训练数据，VLA 的输出空间就等于它——所以模拟 VLA 时**不做任何重排**：
+
+   ```
+   action[0:27] = actions[0:27]   # 策略序关节，原样
+   action[27:30]= actions[27:30]  # roll(绝对) / pitch(绝对) / yaw_vel
+   action[30:33]= actions[30:33]  # anchor 机体系线速度
+   ```
+
+   **`actions[33:40]`（anchor 世界位姿）是 DEBUG 列，VLA 不输出**——这正是
+   `--anchor-source` 那个旋钮的由来：
+
+   * `recorded`（脚本默认）直接发 `[33:40]` 的真值 ⇒ 参考轨迹 === 录制轨迹，
+     但用了一条 **VLA 根本产生不了**的通道，属于理想化参考；
+   * `integrated` 只用 VLA 真会输出的 `[30:33]`，按
+      `JakaTabletopEnv.step()` 那样积分出 anchor 位姿 ⇒ **与真实部署逐位一致**，
+     代价是引入实测 **mean 5.6 cm / max 8.0 cm** 的 anchor 漂移（见第 7 节 TODO）。
+
+   想要"VLA 真会看到什么"就用 `--anchor-source integrated`；想先排除漂移这个变量、
+   单纯验证缓冲时序就用默认的 `recorded`。
 
 ---
 
@@ -352,6 +552,27 @@ motion:
 - [ ] **录制兼容**：`zmq_vla` 后端不适合 `record_jaka_zmq` 工作流（录制走 pico 直连，
       与参考缓冲无关；但 `jaka_lerobot.reference_action_live_latest` 依赖旧类的
       `get_latest_frame()`，新类未实现——若要在 VLA 模式下录制，需补齐）。
+- [ ] **控制循环跑不满 `rl_rate` 时播放延迟无界增长**（机理与实测见 6.3 陷阱 1）。
+      `P` 每次固定推进 `dt_s`，而 teleop 实测只到 45.4–49.5 Hz（配置宣称 50），
+      于是 `newest - P` 持续爬升、缓冲同步膨胀，**无任何日志**。
+      可选修法：把 `get_obs()` 里的 `self._playback_time_ns += self._dt_ns` 换成
+      "按真实墙钟间隔推进"——记下上次调用时刻，`step = min(max(now - last, dt/4), 4*dt)`；
+      停顿期仍由 cap 钉住，**冻结语义不变**，且顺带让 `get_obs()` 对重复调用免疫
+      （即 6.3 陷阱 1 的前半段也一并消掉）。**代价是与 C++
+      `RealtimeMotionBuffer_vla.cpp` 的语义分歧**，故 2026-09-19 决定先记录、暂不改。
+- [ ] **参考被放慢约 9%（属上游客户端，非本类）**：`openpi-eval` 每 25 拍阻塞一次推理
+      （约 120ms），那一次 `env.step()` 只发一帧却吃掉一整个节拍且不再补 sleep，于是实际
+      下发速率是 `25/(24×33.3ms + 120ms) ≈ 27.2 Hz` 而非 30 Hz。接收端按**到达速率**播放
+      （`P` 被 `newest - delay` 钳住），所以**参考轨迹按 0.91× 速度播放**——整条 VLA 链路
+      执行的动作比训练数据的时序慢约 10%。这是 openpi-eval 的循环结构决定的，不是缓冲的
+      问题；要真正 30 Hz 需要缩短推理时间，或把"节拍"与"推理"解耦。实测见 4.7。
+
+- [ ] **openpi-eval 的 anchor 积分路径有数厘米漂移**（属上游客户端，非本类）：
+      若按 `JakaTabletopEnv.step()` 原样从 `action[30:33]` 的机体系线速度积分 anchor
+      世界位姿，相对录制真值的偏差实测 **mean 5.6 cm / max 8.0 cm**（线速度按 pico
+      发布周期算出、却按 1/30 积分，且被 clip 到 ±2.0，实测峰值 2.07 m/s 确实触顶）。
+      用录制数据做参考时建议直接发真值 anchor 位姿
+      （`test_vla_motion_stream.py --anchor-source recorded`，也是该脚本默认）。
 
 ---
 
@@ -366,6 +587,10 @@ motion:
 | `src/SIMPLE-jaka-main/src/simple/jaka_rl/state_processor.py` | **本次修改**：`zmq_vla` 后端接入 |
 | `src/SIMPLE-jaka-main/src/simple/jaka_rl/observations/jaka_mf.py` | 消费方（620 维 obs 解算，未改动，契约见 5.1） |
 | `src/SIMPLE-jaka-main/src/simple/jaka_rl/__init__.py` | **本次修改**：导出 |
+| `src/SIMPLE-jaka-main/src/simple/jaka_rl/base_policy.py` | **本次修改**：`Literal` 加 `zmq_vla` + 注入分支放行（打通链路，见 4.1 ⑤⑥） |
+| `src/SIMPLE-jaka-main/data/jaka_mf/teleop_jaka_mf.yaml` | **本次修改**：`motion_backend: zmq_vla` |
+| `src/SIMPLE-jaka-main/scripts/test_vla_motion_stream.py` | **本次新增**：仿真 openpi-eval 下发（录制 parquet 回放 + 停顿/丢帧/挂掉注入）。默认数据源 `data/simple/JakaTabletopPickTeleop-v0/level-0`；用法见 4.7 |
+| `data/simple/JakaTabletopPickTeleop-v0/level-0` | 47 集规范数据集（VLA 训练用），`actions` 为 **OpenPI 策略序**（见 6.3 陷阱 6）|
 | `src/GR00T-WholeBodyControl4OpenHLM/gear_sonic_deploy/.../streamed_motion_merger.hpp` 等 | sonic 端设计哲学来源（第 2 节） |
 | `src/openpi4OpenHLM/...` / `openpi-eval/` | 上游 VLA 服务器与 30Hz 客户端（契约见 5.3） |
 

@@ -1,6 +1,6 @@
 """Offline dataset replay for the Jaka deployment env, against a live policy server.
 
-Feeds recorded frames from ``teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0``
+Feeds recorded frames from ``teleop_jaka_mf/level-0``
 into ``JakaTabletopEnv`` (via a subclass that overrides ``get_observation``), lets the
 env request inference from a running ``serve_policy.py``, and compares what came back
 with the recorded ground truth. Two things are under the microscope:
@@ -41,8 +41,8 @@ Two extra checks exist because the obvious reading of this data can be wrong:
   because the trunk's velocity and position channels are not self-consistent row by row.
 
 Run on the DEPLOYMENT machine (native, no container/sudo, same machine as the policy
-server). The dataset is auto-detected under the repo -- ``data/simple/...`` there,
-``data/teleop_jaka_mf/simple/...`` on the training machine::
+server). The dataset is auto-detected under the repo -- ``record_teleop/record_data/lerobot_train/teleop_jaka_mf/level-0``
+on the training machine, ``~/lerobot_data/teleop_jaka_mf/level-0`` on the deployment machine::
 
     cd ~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
     export PYTHONPATH=~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
@@ -127,14 +127,16 @@ from jaka_tabletop_env_test import decode_binary_v1, quat_from_rpy
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-# The dataset lives under the repo on both machines, but at different depths: the
-# training machine keeps it under ``data/teleop_jaka_mf/simple/...``, the deployment
-# machine under ``data/simple/...``. Auto-detect so the same file runs on either, and
-# let --dataset-root override when it is somewhere else entirely.
-_DATASET_LEAF = ("simple", "JakaTabletopPickTeleop-v0", "level-0")
+# Training repo id is ``teleop_jaka_mf/level-0`` (shortened). The dataset can live under
+# record_teleop/record_data/lerobot_train/ (this machine), ~/lerobot_data/ (new machine) or
+# the legacy data/ layouts. Auto-detect so the same file runs anywhere, and let
+# --dataset-root override when it is somewhere else entirely.
+_DATASET_LEAF = ("jaka_pick",)
 DATASET_ROOT_CANDIDATES = (
-    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "record_teleop", "record_data", "lerobot_train", *_DATASET_LEAF),
+    os.path.join(os.path.expanduser("~"), "lerobot_data", *_DATASET_LEAF),
     os.path.join(_REPO_ROOT, "data", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", "simple", "JakaTabletopPickTeleop-v0", "level-0"),
 )
 
 

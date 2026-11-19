@@ -90,12 +90,14 @@ from jaka_tabletop_env import PERM_POLICY_TO_SIM, JakaTabletopEnv, _euler_xyz_to
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-# Same two layouts the replay test handles: the training machine keeps the dataset under
-# data/teleop_jaka_mf/simple/..., the robot machine under data/simple/...
-_DATASET_LEAF = ("simple", "JakaTabletopPickTeleop-v0", "level-0")
+# Training repo id is ``teleop_jaka_mf/level-0`` (shortened). Prefer the freshly converted
+# 40-episode set on this machine, then the new machine's copy, then the legacy layouts.
+_DATASET_LEAF = ("jaka_pick",)
 DATASET_ROOT_CANDIDATES = (
-    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "record_teleop", "record_data", "lerobot_train", *_DATASET_LEAF),
+    os.path.join(os.path.expanduser("~"), "lerobot_data", *_DATASET_LEAF),
     os.path.join(_REPO_ROOT, "data", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", "simple", "JakaTabletopPickTeleop-v0", "level-0"),
 )
 
 ACTION_DIM = 33  # what the policy emits and what step() accepts; [33:40] is DEBUG-only

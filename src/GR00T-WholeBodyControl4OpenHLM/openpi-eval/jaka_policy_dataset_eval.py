@@ -106,13 +106,19 @@ from jaka_tabletop_env import _euler_xyz_to_quat_wxyz, _quat_rotate_wxyz
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-_DATASET_LEAF = ("simple", "JakaTabletopPickTeleop-v0", "level-0")
+# Training repo id is ``teleop_jaka_mf/level-0`` (shortened from
+# ``teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0``). Prefer the freshly
+# converted 40-episode set, then the new machine's copy, then the legacy layouts.
+_DATASET_LEAF = ("jaka_pick",)
 DATASET_ROOT_CANDIDATES = (
-    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "record_teleop", "record_data", "lerobot_train", *_DATASET_LEAF),
+    os.path.join(os.path.expanduser("~"), "lerobot_data", *_DATASET_LEAF),
     os.path.join(_REPO_ROOT, "data", *_DATASET_LEAF),
+    os.path.join(_REPO_ROOT, "data", "teleop_jaka_mf", "simple", "JakaTabletopPickTeleop-v0", "level-0"),
 )
 
-DEPLOY_PROMPT = "Pick up the purple soft finger on the table and place it on the mouse pad."
+# Must match the task stored in the JAKA training dataset and main.py's JAKA default.
+DEPLOY_PROMPT = "pick up the box"
 ACTION_DIM = 33   # policy output width; the dataset's [33:40] is DEBUG-only ground truth
 POSE_LO, POSE_HI = 33, 40
 DT = 1.0 / 30.0

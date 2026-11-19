@@ -39,6 +39,27 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false \
   --lr-schedule.decay-steps 30000 \
   --lr-schedule.warmup-steps 1000 \
   2>&1 | tee logs/jaka_v1_$(date +%m%d_%H%M).log
+  
+  
+WANDB_MODE=offline \
+PYTHONUNBUFFERED=1 \
+HF_LEROBOT_HOME=/workspace/OpenHLM/data \
+HF_HOME=/workspace/hf_home \
+HF_HUB_OFFLINE=1 \
+CUDA_VISIBLE_DEVICES=1 \
+JAX_PLATFORMS=cpu \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+./.venv/bin/python scripts/train_pytorch.py jaka_tabletop_pick \
+  --exp-name jaka_pick_real_v1 \
+  --overwrite \
+  --batch-size 8 \
+  --num-workers 4 \
+  --num-train-steps 30000 \
+  --save-interval 5000 \
+  --lr-schedule.decay-steps 30000 \
+  --lr-schedule.warmup-steps 1000 \
+  2>&1 | tee logs/jaka_pick_real_v1_$(date +%m%d_%H%M).log
 ```
 
 **环境变量**（少一个都可能出问题）：

@@ -989,11 +989,11 @@ _CONFIGS = [
         # time, so it passes through unchanged. The state is zero-padded to 33 by
         # PadStatesAndActions for the model input.
         # Run with HF_LEROBOT_HOME pointing at the directory that contains
-        # `teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0`.
+        # `jaka_pick`.
         name="jaka_tabletop_pick",
         model=pi0_config.Pi0Config(pi05=True, action_dim=33, action_horizon=50, discrete_state_input=True),
         data=LeRobotJakaDataConfig(
-            repo_id="teleop_jaka_mf/simple/JakaTabletopPickTeleop-v0/level-0",
+            repo_id="jaka_pick",
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
