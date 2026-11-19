@@ -181,20 +181,7 @@ print(p.infer(aloha_policy.make_aloha_example())['actions'].shape)
 与训练机原命令相比，**只有 `--batch-size` 可按显存调整**；默认 `bfloat16` 精度下
 AdamW 状态也是 bf16（16-bit Adam），不要加 `--use-8bit-adam`。
 
-本机主要承担**推理 / 部署验证**：
-
-```bash
-cd src/openpi4OpenHLM
-
-# 1) 策略服务（Jaka）
-CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
-
-# 2) 部署客户端（另一个终端）
-cd ../GR00T-WholeBodyControl4OpenHLM/openpi-eval
-PYTHONPATH=.. ~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
-  --env jaka_tabletop_pick --remote-host 127.0.0.1 --remote-port 8000 \
-  --jaka-motion-zmq-port 28701 --max-steps 1000 <<< $'s\n'
-```
+本机的实机 checkpoint、服务启动和客户端自检命令见 [11 本机部署](11-local-deploy.md)。
 
 > 显存提醒：如果确实要在本机 3090（24 GB）上微调，先只调 `--batch-size`（1～4 起）；
 > 官方给出的全量微调参考显存是 >70 GB（A100/H100）。

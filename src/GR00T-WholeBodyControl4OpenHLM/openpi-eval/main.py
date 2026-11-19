@@ -2,7 +2,8 @@
 import sys
 import os
 
-# Add the project root to sys.path to allow imports from examples
+# Resolve gear_sonic when running directly from the checkout.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import contextlib
@@ -21,7 +22,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
 from sonic_g1_env import SonicG1Env, DEFAULT_MIMIC_OBS_G1, DEFAULT_MIMIC_OBS_G1_RAISED
-from jaka_tabletop_env import JakaTabletopEnv, DEFAULT_STATE_JAKA
+from jaka_tabletop_env import DEFAULT_INITIAL_ANCHOR_POS, DEFAULT_STATE_JAKA, JakaTabletopEnv
 
 ########################################################
 # copy and paste the following code to SONIC codebase
@@ -89,14 +90,10 @@ class Args:
     num_frames_to_send: int = 2  # Number of frames to buffer before sending a single ZMQ message
 
     # Robot network parameters (JakaTabletopEnv)
-    # The receiver (RealtimeMotionBufferVla) subscribes to tcp://127.0.0.1:28701.
-    jaka_motion_zmq_address: str = "*"
+    # PUB bind interface. Real observations default to all interfaces, mock to loopback.
+    jaka_motion_zmq_address: str | None = None
     jaka_motion_zmq_port: int = 28701
-    # Observation channels -- these are SIMPLE's ``JakaTeleopZmqPublisher`` bind
-    # points (``state_zmq_bind`` / ``camera_zmq_bind`` in
-    # ``data/jaka_mf/teleop_jaka_mf.yaml``), i.e. what the teleop publishes while
-    # it drives the Jaka robot. Defaults changed 28702/28703 -> 28711/28712 to
-    # match; if the teleop config is edited, edit these too.
+    # Connect to the measured state publisher and the RGB camera publisher.
     jaka_state_address: str = "127.0.0.1"
     jaka_state_port: int = 28711
     jaka_head_image_address: str = "127.0.0.1"
@@ -107,7 +104,7 @@ class Args:
     # an arbitrary origin (root_pos_diff_b is translation-invariant). The dataset means
     # are (0.27934, -0.95991, 0.60442) for the position and
     # (0.62867, 0.02642, -0.00725, 0.76849) for the wxyz quaternion.
-    jaka_initial_anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.604)
+    jaka_initial_anchor_pos: tuple[float, float, float] = DEFAULT_INITIAL_ANCHOR_POS
     jaka_initial_anchor_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)  # radians
 
     # Visualization
@@ -268,6 +265,21 @@ def build_policy_request(env_name, obs, instruction, last_executed_action):
     return request_data
 
 
+def jaka_action_chunk(result, open_loop_horizon):
+    """Validate the policy response before publishing any part of the chunk."""
+    actions = np.asarray(result["actions"])
+    if actions.ndim != 2 or actions.shape[1] != 33 or len(actions) < open_loop_horizon:
+        raise ValueError(
+            f"JAKA requires at least {open_loop_horizon} rows of 33 actions, got {actions.shape}"
+        )
+    if actions.dtype.kind not in "fiu":
+        raise ValueError("JAKA requires numeric actions")
+    actions = actions.astype(np.float32, copy=False)
+    if not np.isfinite(actions).all():
+        raise ValueError("JAKA policy returned a nonfinite action")
+    return actions
+
+
 def main(args: Args):
     if args.debug:
         import debugpy
@@ -284,6 +296,8 @@ def main(args: Args):
     else:
         action_dim, state_dim = 33, 30
         num_cameras = 1  # jaka has a single head camera; JakaInputs masks the wrist views
+        if not 1 <= args.open_loop_horizon <= 50:
+            raise ValueError("JAKA open_loop_horizon must be between 1 and the policy horizon of 50")
     print(f"Using env={args.env}, action_dim={action_dim}, state_dim={state_dim}")
 
     # Resolve the prompt before the warmup request so every episode uses the same text.
@@ -309,7 +323,7 @@ def main(args: Args):
         env = JakaTabletopEnv(
             control_hz=args.control_hz,
             mock=args.mock,
-            motion_zmq_address=args.jaka_motion_zmq_address,
+            motion_zmq_address=args.jaka_motion_zmq_address or ("127.0.0.1" if args.mock else "*"),
             motion_zmq_port=args.jaka_motion_zmq_port,
             state_address=args.jaka_state_address,
             state_port=args.jaka_state_port,
@@ -321,6 +335,15 @@ def main(args: Args):
         )
         print("Initialized JakaTabletopEnv")
 
+    try:
+        run_rollouts(args, env, action_dim, num_cameras)
+    finally:
+        env.close()
+        if args.opencv_visualize:
+            cv2.destroyAllWindows()
+
+
+def run_rollouts(args, env, action_dim, num_cameras):
     if args.env == "sonic_g1":
         print("\nResetting robot to default pose (arms down)...")
         obs = env.reset(default_pose=DEFAULT_MIMIC_OBS_G1)
@@ -356,6 +379,8 @@ def main(args: Args):
     start_time = time.time()
     for _ in range(10):
         result = policy_client.infer(build_policy_request(args.env, obs, args.instruction, None))
+        if args.env == "jaka_tabletop_pick":
+            jaka_action_chunk(result, args.open_loop_horizon)
     print(f"Policy server warmed up in {time.time() - start_time:.3f} seconds.")
 
     # Generate timestamp once for all episodes (used for saving action chunks)
@@ -451,7 +476,10 @@ def main(args: Args):
                     inference_start = time.time()
                     with prevent_keyboard_interrupt():
                         result = policy_client.infer(request_data)
-                        pred_action_chunk = result["actions"]
+                        pred_action_chunk = (
+                            jaka_action_chunk(result, args.open_loop_horizon)
+                            if args.env == "jaka_tabletop_pick" else result["actions"]
+                        )
                     policy_inference_time = time.time() - inference_start
                     
                     # Record action chunk if saving is enabled
@@ -498,14 +526,15 @@ def main(args: Args):
                     "actual_hz": f"{actual_control_hz:.1f}"
                 })
             except KeyboardInterrupt:
-                print("\n\nCtrl+C detected. Resetting robot to default pose...")
+                print("\n\nCtrl+C detected.")
                 if video_writer is not None:
                     video_writer.release()
                     print(f"Video saved to: {video_path}")
                     video_writer = None
-                env.reset()
-                time.sleep(2.0)
-                print("Reset complete.")
+                if args.env == "sonic_g1":
+                    env.reset()
+                    time.sleep(2.0)
+                    print("Reset complete.")
                 break
 
         print("Evaluation finished.")
@@ -553,19 +582,19 @@ def main(args: Args):
         
         if input("\nDo one more eval? (enter y or n) ").lower() != "y":
             break
-        print("\nResetting robot to default pose...")
+        print("\nContinuing the same JAKA reference stream and integrated base pose."
+              if args.env == "jaka_tabletop_pick" else "\nResetting robot to default pose...")
         env.reset()
-        time.sleep(2.0)
-        print("Reset complete.")
+        if args.env == "sonic_g1":
+            time.sleep(2.0)
+            print("Reset complete.")
 
     # Final cleanup: reset robot to default pose before exiting
-    print("\nProgram exiting. Resetting robot to default pose...")
-    env.reset()
-    time.sleep(2.0)
-    print("Final reset complete.")
-    
-    if args.opencv_visualize:
-        cv2.destroyAllWindows()
+    if args.env == "sonic_g1":
+        print("\nProgram exiting. Resetting robot to default pose...")
+        env.reset()
+        time.sleep(2.0)
+        print("Final reset complete.")
 
 if __name__ == "__main__":
     args: Args = tyro.cli(Args)

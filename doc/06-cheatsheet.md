@@ -92,16 +92,16 @@ tail -f "$LOG" | grep --line-buffered -o 'step=[0-9]* loss=[0-9.]*.*'
 ```bash
 # 服务端
 cd /workspace/OpenHLM/src/openpi4OpenHLM
-./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
-# 或指定 ckpt：
-#   policy:checkpoint --policy.config=jaka_tabletop_pick \
-#                     --policy.dir=checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000
+./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
+  policy:checkpoint --policy.config jaka_tabletop_pick \
+  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 
 # 客户端（容器内，三要素：PYTHONPATH + --no-opencv-visualize + 喂 stdin）
 docker exec -i -w /workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval \
   -e PYTHONPATH=/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM \
   xujinfan_dev /workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
-  --env jaka_tabletop_pick --mock --use-fake-policy --max-steps 200 --no-opencv-visualize
+  --env jaka_tabletop_pick --mock --jaka-motion-zmq-address 127.0.0.1 --jaka-motion-zmq-port 38893 \
+  --use-fake-policy --max-steps 200 --no-opencv-visualize
 
 # 协议测试
 docker exec -i -w /workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval \
@@ -128,14 +128,14 @@ docker exec -i -w /workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-e
 
 | 项 | 值 |
 | --- | --- |
-| state 维度 | 30（dof27 + rpy3，**无速度**） |
+| state 维度 | 30（27 个实测关节角、base roll、pitch、yaw 角速度） |
 | actions 维度（录制） | 40（30 + anchor_lin_vel3 + anchor_pos_w3 + anchor_quat_w4） |
-| actions 维度（训练） | 33（dof27 + rpy3 + base_vel3） |
+| actions 维度（训练） | 33（27 个参考关节角、roll、pitch、yaw 角速度、base 系线速度 3） |
 | 训练用排列 | 手臂优先：arm_l, arm_r, leg_l, leg_r, waist, neck, root |
-| Jaka ZMQ 端口 | 28701（motion）/ 28702（state）/ 28703（head image） |
+| Jaka ZMQ 端口 | 28701（motion）/ 28711（state）/ 28712（head image） |
 | 策略服务端口 | 8000 |
 | 控制频率 / 开环 horizon | 30 Hz / 25 步（horizon 50） |
-| 当前 ckpt | `jaka_tabletop_pick_v1` step 30000 |
+| 当前实机 ckpt | `jaka_pick_real_v1` step 30000 |
 
 ## 应急
 

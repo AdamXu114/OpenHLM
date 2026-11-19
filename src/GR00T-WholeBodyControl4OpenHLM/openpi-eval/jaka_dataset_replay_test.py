@@ -51,7 +51,7 @@ on the training machine, ``~/lerobot_data/teleop_jaka_mf/level-0`` on the deploy
     cd ~/Workspace/OpenHLM/src/openpi4OpenHLM
     ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
 
-    # terminal 2: this script -- smoke first, then the full 47 episodes
+    # terminal 2: this script -- smoke first, then all episodes
     ~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python jaka_dataset_replay_test.py \
       --mode both --episodes 0 --max-chunks 4
     ~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python jaka_dataset_replay_test.py \
@@ -61,7 +61,7 @@ on the training machine, ``~/lerobot_data/teleop_jaka_mf/level-0`` on the deploy
 cheapest way to check the plumbing before spending GPU time.
 
 Useful flags: ``--episodes 0 1 2`` (SPACE separated -- tyro takes a tuple, so
-``--episodes 0,1,2`` is a parse error; empty = all 47), ``--max-chunks N`` to stop early,
+``--episodes 0,1,2`` is a parse error; empty = all episodes), ``--max-chunks N`` to stop early,
 ``--dataset-root`` if the data is somewhere else, ``--remote-host/--remote-port`` for the
 policy server, ``--prompt`` to override the dataset's own instruction, ``--out-dir``.
 Outputs land in the cwd-independent ``<script dir>/visualization/dataset_replay/<stamp>/``.
@@ -73,10 +73,7 @@ Same script inside the training container, for reference::
       xujinfan_dev /workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python \
       jaka_dataset_replay_test.py --mode gt --episodes 0
 
-The action PUB writes to 28701, the real deployment port. That is fine as long as no
-``RealtimeMotionBufferVla`` / robot is subscribed -- nothing else needs to listen for the
-wire check, which subscribes itself. **Before running this with a live receiver, pass
-``--motion-port 28799``**, or the replayed trajectory will drive the robot.
+The wire check uses a local PUB/SUB pair on 127.0.0.1:28799 by default.
 
 Known trap: the server blocks its event loop while inferring, so the first client request
 after a server restart can die on the 20 s ping timeout. ``PolicyClient`` reconnects once.
@@ -119,7 +116,7 @@ except ImportError:
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
-from jaka_tabletop_env import JakaTabletopEnv, PERM_POLICY_TO_SIM
+from jaka_tabletop_env import JakaTabletopEnv, PERM_POLICY_TO_SIM, validate_base_replay_dataset
 # Reuse the wire-contract test's authoritative implementations: ``decode_binary_v1`` is
 # AST-extracted from the receiver's motion_buffer.py, ``quat_from_rpy`` from
 # action_trunk_reconstruct.py, so both agree with the offline reference by construction.
@@ -303,7 +300,9 @@ def load_episode(root: str, episode: int) -> dict:
     # "bytes" field is the inline PNG (this dataset has no videos/ directory).
     blobs = table["head_image_left"].combine_chunks().field("bytes")
     for i, blob in enumerate(blobs):
-        images[i] = np.asarray(Image.open(io.BytesIO(blob.as_py())).convert("RGB"), dtype=np.uint8)
+        with Image.open(io.BytesIO(blob.as_py())) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        images[i] = image_tools.resize_with_pad(rgb, 224, 224)
 
     return {
         "index": episode,
@@ -1310,15 +1309,16 @@ def save_arrays(runs: list, path: Path) -> None:
 
 @dataclasses.dataclass
 class Args:
+    assume_base_link: bool = False  # for verified, unmarked datasets
     mode: Literal["gt", "policy", "both"] = "both"
     dataset_root: str = DEFAULT_DATASET_ROOT
-    episodes: tuple[int, ...] = ()       # empty = all 47
+    episodes: tuple[int, ...] = ()       # empty = all episodes
     max_chunks: int = 0                  # >0 = stop after N chunks per episode (smoke test)
     open_loop_horizon: int = 25
     prompt: str = ""                     # empty = the dataset's own task string
     remote_host: str = "127.0.0.1"
     remote_port: int = 8000
-    motion_port: int = 28701             # the real port; use 28799 if a receiver is live
+    motion_port: int = 28799             # loopback wire check
     out_dir: str = ""                    # empty = visualization/dataset_replay/<timestamp>
     plot_episode: int = -1               # -1 = the first episode with a policy run
     no_plots: bool = False
@@ -1336,6 +1336,7 @@ def main(args: Args):
             f"auto-detected candidates that were tried:\n{checked}\n"
             f"pass --dataset-root <path to the level-0 dir> if it lives elsewhere"
         )
+    validate_base_replay_dataset(root, assume_base_link=args.assume_base_link)
     check_meta(root)
 
     lengths = episode_lengths(root)

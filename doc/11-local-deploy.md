@@ -73,9 +73,7 @@ export CUDA_VISIBLE_DEVICES=0
   --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 ```
 
-- `EnvMode.JAKA` 的值就是 `jaka_tabletop_pick`，两种写法等价。
-- **不传 `policy:checkpoint` 会退回 `DEFAULT_CHECKPOINT[EnvMode.JAKA]`**，
-  那是旧路径 `checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000`，注意别加载错。
+- 服务端 CLI 的枚举参数用 `--env JAKA`，训练配置用 `--policy.config=jaka_tabletop_pick`。JAKA 服务要求显式选择 checkpoint，以免自动加载旧的 waist 权重。
 - 首次加载约 1–2 分钟；日志出现 `server listening on 0.0.0.0:8000` 即就绪。
 - 想换采样步数就改 `--num-steps`（默认 10，越少越快）。
 
@@ -98,7 +96,9 @@ PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM \
 
 ### A. 连真机
 
-前提：机器人侧 `state`(:28711)、`camera`(:28712) 在发布，下游 `RealtimeMotionBufferVla` 在监听 `:28701`。
+在机器人实际使用的 `KpiConfig.yaml` 中，将 `jakaminimimic_superzmq.motion_backend` 设为 `vla_pose_v1`，`zmq_connect` 设为 `tcp://<运行 main.py 的 PC 地址>:28701`。客户端绑定 motion PUB，机器人主动连接它。要使用 180k EMA tracker，控制器的 `policy_path` 应指向已验证的 `policy_mimic/ckpt_0180000_bones_ema.onnx`。
+
+启动 RGB 相机发布器并进入 SuperZmq，让实测 state（28711）和相机（28712）均开始发布。以下命令读取环境变量 `ROBOT_IP`；如果相机发布器位于另一台机器，可用 `CAMERA_IP` 单独指定。
 
 ```bash
 cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
@@ -108,39 +108,45 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
   --env jaka_tabletop_pick \
   --remote-host 127.0.0.1 --remote-port 8000 \
   --jaka-motion-zmq-port 28701 \
-  --jaka-state-address <机器人IP> --jaka-state-port 28711 \
-  --jaka-head-image-address <机器人IP> --jaka-head-image-port 28712 \
-  --instruction "pick up the box" \
-  --max-steps 100000
+  --jaka-state-address "${ROBOT_IP:?请设置机器人 IP}" --jaka-state-port 28711 \
+  --jaka-head-image-address "${CAMERA_IP:-$ROBOT_IP}" --jaka-head-image-port 28712 \
+  --control-hz 30 --open-loop-horizon 25 \
+  --instruction "pick up the box" --max-steps 100000
 ```
 
-- 客户端会阻塞等一个 `s` 再开始，SSH/无显示时加 `--no-opencv-visualize`。
-- 指令默认就是 `pick up the box`，`--instruction` 不传也一样；**不要**改成别的说法，
-  否则和训练时的 language conditioning 不一致。
-- 推理端动作是 33 维（27 关节 + root 3 + anchor_lin_vel 3），`JakaOutputs` 已截断，
-  `JakaTabletopEnv.step()` 负责转成 SIM 顺序并发布协议 v1 帧。
+- 客户端默认最多等待 3 s 以取得初始观测并开始预热，输入 `s` 回车后开始发参考。SSH 无显示时加 `--no-opencv-visualize`。两路观测独立更新，短时复用最近的有效样本；本地接收年龄上限为 0.30 s，持续缺失或超龄会报错并停止。相机使用 RGB；相机线协议只含宽、高、通道数和像素，接收年龄无法反映曝光时刻。
+- 默认 prompt 是训练文本 `pick up the box`。输入是 30 维 state 和一张按比例缩放并补边的 224×224 RGB 图。策略每次返回 50 个 33 维动作；每帧含 27 个参考关节角、roll、pitch、yaw 角速度、3 维 base 系线速度。
+- 初始 `base_link` 高度使用实机数据集均值 0.604 m。若起始姿态不同，可传 `--jaka-initial-anchor-pos X Y Z`。每帧先发布当前位姿，再按 1/30 s 积分下一帧；模型的 33 维输出不含绝对高度。
+- 28701 每包默认带相邻两帧、`anchor_body=base_link`、`joint_order=jaka`、本实例的 `stream_id`。同一实例换动作块时，帧号、位置、yaw 连续。结束一条任务、机器人复位后要从新原点开始时，退出 SuperZmq，重启客户端并从新的初始 pose 重新进入 SuperZmq。控制器默认在收到首批有效帧之后连续 1 s 没有新帧时锁存参考，需要退出并重新进入该模式。
 
 ### B. 本地自检（无机器人）
 
 ```bash
-# 真策略服务 + 随机观测（验证 观测→推理→发布 全链路，不发到真机也不会报错）
-... python main.py --env jaka_tabletop_pick \
-  --remote-host 127.0.0.1 --remote-port 8000 \
-  --mock --max-steps 50 --no-opencv-visualize
+cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
+export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
+PY=~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python
 
-# 完全不连服务：假策略，只验证发布链路
-... python main.py --env jaka_tabletop_pick --mock --use-fake-policy \
+# 真策略服务 + 合成观测；发布到独立回环端口
+"$PY" main.py --env jaka_tabletop_pick --remote-host 127.0.0.1 --remote-port 8000 \
+  --mock --jaka-motion-zmq-address 127.0.0.1 --jaka-motion-zmq-port 38893 \
+  --max-steps 50 --no-opencv-visualize
+
+# 同一客户端和打包器，使用假策略，可单独运行
+"$PY" main.py --env jaka_tabletop_pick --mock --use-fake-policy \
+  --jaka-motion-zmq-address 127.0.0.1 --jaka-motion-zmq-port 38893 \
   --max-steps 50 --no-opencv-visualize
 ```
+
+两种自检都等待输入 `s`，完成后输入 `n` 退出。`--mock` 使用合成观测，motion PUB 仍会发包，默认仅绑定回环地址。
 
 ## 6. 本机性能参考（RTX 3090 实测）
 
 | 项 | 数值 |
 | --- | --- |
-| 模型显存 | 加载后约 7.5 GB，峰值 **7.11 GiB** |
+| 模型显存 | 约 7.1 GiB |
 | 首次推理 | ~129 s（Triton autotune + 首次 kernel） |
 | 稳态推理 | ~140 ms / 50 步 chunk |
-| 控制频率/开环 | 30 Hz / 25 步，每次推理预算约 0.83 s，余量充足 |
+| 控制频率/开环 | 动作时间轴为 30 Hz，每执行 25 步同步推理；25 步对应约 0.83 s 的轨迹，推理耗时会出现在跨块发包间隔中 |
 
 ## 7. 已知问题（部署前必读）
 
@@ -149,7 +155,7 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
    **不要**再用旧 waist 的 0.83 —— 它比 base 高 0.22385 m，会让参考整体抬高 0.22 m。
    旧 `jaka_tabletop_pick_v1` 是 waist 标签训练的，不要在新下游上部署。
 2. **prompt**：训练/部署必须同为 `pick up the box`。
-3. **`PYTHONPATH`**：`main.py` 依赖 `src/GR00T-WholeBodyControl4OpenHLM` 在 `PYTHONPATH` 里。
+3. **`PYTHONPATH`**：`main.py` 直接运行时会定位同仓库的 `gear_sonic`；回放脚本仍可沿用示例的 `PYTHONPATH`。
 4. **opencv**：无 X display 时 `cv2.imshow` 会 abort，加 `--no-opencv-visualize`。
 5. **别在本机训练**：3090 24 GB 放不下 3.6B 模型 + 优化器状态；训练在服务器上做。
 
@@ -157,7 +163,7 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 
 - `jaka_policy_dataset_eval.py`：策略对数据集 ground truth 的误差对比（需要起策略服务）。
 - `jaka_dataset_action_publisher.py`：把数据集的 33 维动作直接下发给控制器，
-  先加 `--dry-run` 验证，再真发。
+  可先用 `--dry-run --episodes 0 --anchor-from-dataset` 验证录制初始高度、yaw 和动作转换。发布器检查 `conversion_manifest.json` 的 `anchor_body_name`；旧数据缺少标识且已确认使用 base_link 时可传 `--assume-base-link`。
 
 两个脚本都会自动探测数据集根目录（`record_teleop/record_data/lerobot_train/jaka_pick`），
 也可用 `--dataset-root` / `--episodes` 指定。

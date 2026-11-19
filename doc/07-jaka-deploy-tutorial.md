@@ -1,10 +1,9 @@
 # 07 Jaka 部署教程（最终部署命令）
 
-**部署机：新机器，原生运行（不在 docker 里），无需 GPU 预约。** 仓库在 `~/Workspace/OpenHLM`。
+**部署机：新机器，原生运行（不在 docker 里），无需 GPU 预约。** 仓库在 `~/workspace/OpenHLM`。
 策略服务端与部署客户端在**同一台机器**上跑，因此不需要 `--remote-host` 指向别的机器。
 
-链路：`serve_policy.py` ──websocket :8000──► `main.py`(`--env jaka_tabletop_pick`) ──ZMQ :28701──►
-`RealtimeMotionBufferVla`（下游接收方，常驻，不用动）。
+`main.py` 向 `serve_policy.py` 的 WebSocket 8000 请求动作，在部署 PC 的 28701 发布轨迹。机器人进入 SuperZmq 后订阅轨迹，并在 28711 发布实测 state。头部相机另在 28712 发布 RGB。
 
 > 本文是**照着敲就能跑**的最终版；原理、anchor 约定、参数表见 [04-deployment.md](04-deployment.md)。
 > 只有改了发布协议才需要跑 [04-deployment.md §4.4](04-deployment.md) 的协议对拍测试。
@@ -17,16 +16,10 @@
 
 ```bash
 # 确认仓库在
-ls ~/Workspace/OpenHLM/src/openpi4OpenHLM/scripts/serve_policy.py
+ls ~/workspace/OpenHLM/src/openpi4OpenHLM/scripts/serve_policy.py
 
-# 确认 checkpoint 在
-ls ~/Workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/
-# 期望看到 5000 10000 15000 20000 25000 30000；30000 是默认部署步数
-
-# 若是新机器首次拉 ckpt：从 HF 公开仓库 XuJinfan/jaka-tabletop-pick-v1 取 30000.tar，
-# 在 checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/ 下解包（tar 顶层就是 30000/，且已含 assets/）
-ls -l ~/Workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000/model.safetensors
-# 期望 7,473,099,660 字节
+# 检查本机的 base_link checkpoint
+ls -l ~/workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000/model.safetensors
 ```
 
 需要的文件（都已就位，无需改动）：
@@ -34,13 +27,13 @@ ls -l ~/Workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka
 
 | 作用           | 文件                                                                                        |
 | ------------ | ----------------------------------------------------------------------------------------- |
-| 策略服务端        | `~/Workspace/OpenHLM/src/openpi4OpenHLM/scripts/serve_policy.py`                          |
-| 部署客户端        | `~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval/main.py`              |
-| Jaka 环境（发动作） | `~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval/jaka_tabletop_env.py` |
+| 策略服务端        | `~/workspace/OpenHLM/src/openpi4OpenHLM/scripts/serve_policy.py`                          |
+| 部署客户端        | `~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval/main.py`              |
+| Jaka 环境（发动作） | `~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval/jaka_tabletop_env.py` |
 
 
 Python 解释器统一用 openpi 的 venv：
-`~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python`
+`~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python`
 
 部署**不需要** `pi05_base` / `pi05_base_pytorch` 权重，也不需要 LeRobot 数据集——
 服务端只读 `<ckpt>/model.safetensors` 和 `<ckpt>/assets/<asset_id>/norm_stats.json`。
@@ -63,97 +56,65 @@ tmux new -s jakadep
 ## 2. 窗口 1：策略服务端
 
 ```bash
-cd ~/Workspace/OpenHLM/src/openpi4OpenHLM
-./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
-```
-
-`--env JAKA` 等价于 `--env jaka_tabletop_pick`，checkpoint 走
-`serve_policy.py` 里 `DEFAULT_CHECKPOINT[EnvMode.JAKA]` 的默认值
-（`checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000`）。
-
-**换 checkpoint 步数**时显式指定，别改代码：
-
-```bash
+cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
-  policy:checkpoint \
-  --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000
+  policy:checkpoint --policy.config jaka_tabletop_pick \
+  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 ```
 
 等到出现监听日志（默认 `0.0.0.0:8000`）再进下一步。
 
-> `--num-steps 10` 与服务端自检有关，**不影响客户端推理**，保持默认即可。
+> `--num-steps` 设置服务端每次生成 action chunk 的采样步数。它会影响推理耗时，默认值为 10。
 
 ---
 
 ## 3. 窗口 2：部署客户端（推理 + 发动作）
 
 ```bash
-cd ~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
-export PYTHONPATH=~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
+cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
+export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 
-~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
+~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
   --env jaka_tabletop_pick \
   --remote-host 127.0.0.1 --remote-port 8000 \
   --jaka-motion-zmq-port 28701 \
-  --max-steps 100000 \
-  <<< $'s\n'
+  --jaka-state-address "${ROBOT_IP:?set robot IP}" --jaka-head-image-address "$ROBOT_IP" \
+  --instruction "pick up the box" \
+  --max-steps 100000
 ```
 
 同机部署，`--remote-host 127.0.0.1` 即可（`--remote-port` 与服务端 `--port` 一致，默认都是 8000）。
 
-两个必须的要素：
-
-
-| 要素                                                                  | 原因                                                                                                          |
-| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `PYTHONPATH=~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM` | `sonic_g1_env` 会 import `gear_sonic`，openpi 的 venv 里没有；不加这句 main.py 在 import 阶段就死（原始生产环境用的是 `.venv_teleop`） |
-| 喂 stdin（`<<< $'s\n'`）                                               | 主循环阻塞在 `input()` 等 's'，喂一个 `s` 才开始发帧                                                                        |
-
-
-> SSH 远程连这台机器时**再加** `--no-opencv-visualize`：无 X display 时 cv2 在 `imshow` 上直接 abort，
-> 而该参数**默认是 True**。本地桌面有显示则不用加。想手动控制就把 `<<< $'s\n'` 去掉、直接在终端敲 `s` 回车。
+`PYTHONPATH` 中的 `GR00T-WholeBodyControl4OpenHLM` 提供 `gear_sonic`。客户端等待终端输入 `s` 回车后开始发送参考。远程 SSH 无显示器时加 `--no-opencv-visualize`。
 
 常用可选项：
 
 
 | 参数                                           | 说明                                         |
 | -------------------------------------------- | ------------------------------------------ |
-| `--instruction "<文本>"`                       | 语言指令，默认是紫色软指那条                             |
+| `--instruction "<文本>"`                       | 语言指令，JAKA 默认为 `pick up the box`                             |
 | `--max-steps <n>`                            | 跑多少步（30 Hz，1000 步 ≈ 33 s）                  |
 | `--control-hz 30` / `--open-loop-horizon 25` | 控制频率 / 开环步数（策略 chunk 是 50，最多开环 25）         |
 | `--save-video --video-save-dir <dir>`        | 存 MP4（单路 head 图，480×480）                   |
-| `--jaka-initial-anchor-pos "0.0 0.0 0.83"`   | anchor 初始位置，**z 有意义**（`root_z_mf` 是绝对世界 z） |
+| `--jaka-initial-anchor-pos X Y Z`（默认 `0 0 0.604`）   | anchor 初始位置，**z 有意义**（`root_z_mf` 是绝对世界 z） |
 
 
-跑起来后应该看到：连上策略服务端的日志、每个 chunk（50 步）一次约 70–80 ms 的推理、
+跑起来后应该看到：连上策略服务端的日志、默认每执行 25 步重新推理一次、
 30 Hz 往 `tcp://*:28701` 发协议 v1 二进制帧。
 
 ### 跑多久 / 为什么会自己停
 
-`--max-steps 1000` @ 30 Hz ≈ **35 秒**就跑满一轮，这不是崩溃。跑满后代码会问
-`Do one more eval? (enter y or n)`；用 `<<< $'s\n'` 启动时 stdin 里只剩一个空行
-（bash 会给 here-string 再补一个换行，所以实际是 "s" + 空行两行），
-空行 ≠ `y` → 走正常退出路径（重置 → `Final reset complete.`）。要跑久一点就调大：
+30 Hz 下执行 1000 步约需 33 秒，再加上各次同步推理的停顿。跑满后终端会询问 `Do one more eval? (enter y or n)`。输入 `y` 开始下一轮，其他输入结束并关闭 JAKA 客户端。如果停顿超过控制器的参考超时时间，先核对新的起始姿态，在控制器退出并重入 SuperZmq 后再发新轨迹。
 
-```bash
---max-steps 100000        # ≈ 55 分钟
-```
-
-想每轮结束手动决定是否继续，就用 `<<<` 的形式、在终端里交互敲 `s`，结束时敲 `y`。
-
-停止：客户端窗口 `Ctrl+C`（回初始位姿）→ 服务端窗口 `Ctrl+C`。
+停止：客户端窗口 `Ctrl+C`（结束本轮参考发布）→ 服务端窗口 `Ctrl+C`。
 
 ---
 
 ## 4. 下游接收方
 
-不用重启、不用改配置，确保 `RealtimeMotionBufferVla`（`data/jaka_mf/teleop_jaka_mf.yaml` 里
-`motion_backend: zmq_vla`）订阅 `tcp://127.0.0.1:28701` 即可。健康检查看接收端日志：
+在控制器实际读取的 `KpiConfig.yaml` 中，将 `jakaminimimic_superzmq.motion_backend` 设为 `vla_pose_v1`，`zmq_connect` 指向部署 PC 的 `tcp://<PC-IP>:28701`。启动相机并让机器人进入 SuperZmq，客户端收到有效 state 与 RGB 后才开始推理。相机发布器使用 RGB。模型权重由控制器的 `policy_path` 选择，复现 180k EMA 结果须选择相应的 ONNX 和配套部署参数。
 
-- 不应出现 `binary decode failed` / `joint dim mismatch` / `body dim mismatch`
-- `stale_ms()` 在 chunk 边界涨到 ~120 ms、chunk 内部回落
-- `latest_timestamp_ns - playback_time_ns ≈ 120 ms` 且**不随停顿漂移**
+每个动作包注明 `anchor_body=base_link`、JAKA 关节顺序和发布器 `stream_id`。相邻滑窗通常重复一帧。若启用控制器的 policy diagnostic，`latest_frame_index` 和 `valid_receive_age_ns` 来自同一次窗口采样，首次收到有效包前均为 −1。`stream_hold_reason` 说明参考被锁定的原因。
 
 ---
 
@@ -164,24 +125,17 @@ export PYTHONPATH=~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 | ----- | --------- | -------------------------------------- |
 | 8000  | 客户端 → 服务端 | websocket 策略推理                         |
 | 28701 | 客户端 → 下游  | 协议 v1 二进制动作帧（`--jaka-motion-zmq-port`） |
-| 28711 | 观测 → 客户端  | `jaka_state`（占位通道，**仓库内暂无发布方**）        |
-| 28712 | 观测 → 客户端  | `jaka_head`（占位通道，**仓库内暂无发布方**）         |
+| 28711 | 观测 → 客户端  | 实测关节与 base 四元数（StatePublisher，JSON）        |
+| 28712 | 观测 → 客户端  | 头部 RGB（cam_pub，12 字节图像头 + uint8 像素）         |
 
 
 ---
 
 ## 6. 坑（都会静默失败，务必看）
 
-1. **首次连接必失败。** 服务端在 infer 期间阻塞事件循环，每次**重启服务端后第一个**客户端会撞上
-  20 s ping 超时。**重连一次即可**，不是配置问题。
-2. **不要靠重启客户端来"复位"。** `frame_index` 一旦回退会被接收端静默去重，参考轨迹**永久冻结**。
-  `JakaTabletopEnv.reset()` 已刻意不复位它，别改。
-   **注意 `Ctrl+C` 结束客户端进程后重新启动，`frame_index` 会从 0 重新开始**——
-   这时必须**同时重启下游接收方**（它的去重基线跨自己的 `clear()` 保留），
-   否则新发的帧全被丢掉、机器人不动。因此宁可开始就把 `--max-steps` 开大，别中途重启。
-3. **推理停顿不能被帧填满。** 每块 25 步开环 ≈120 ms 无数据是**期望行为**，接收端按
-  "间隙 > 50 ms 即停顿" 重锚时间轴。**不要**加 filler 帧。
-4. **观测通道目前是占位。** 28711/28712 没有发布方时，`get_observation()` 退化为全零 state + 黑图——
-  链路照跑、动作照发，但策略看不到画面。真机部署需要机器人侧提供这两路 msgpack 发布。
+1. 服务端首次推理可能需要预热。如遇 WebSocket 超时，先检查服务端是否已完成加载，再重新连接。
+2. 同一发布器的 reset 保留编号与积分 pose。新实例会更换 `stream_id` 并从新提供的 base 初值开始。
+3. 默认每执行 25 步同步推理下一块动作。停顿期间保留实际执行的帧序号。
+4. 实机模式等待新鲜的 state 和 head。报 `No fresh ...` 时，按提示检查该发布源地址、数据格式与发送进度。
 5. **视频宽度。** jaka 只有 1 路 head 图，`VideoWriter` 宽度按单图算；改 `num_cameras` 会让写帧静默失败。
 

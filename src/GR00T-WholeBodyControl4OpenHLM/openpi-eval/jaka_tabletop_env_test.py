@@ -1,20 +1,19 @@
-"""Wire-contract test for JakaTabletopEnv against the downstream decoder.
+"""Exercise the JAKA publisher, its sliding windows and live observations.
 
-Validates that what ``JakaTabletopEnv`` publishes can be decoded by the receiver
-side (``RealtimeMotionBufferVla``). The authoritative decoder lives in
-``implement_action_analysis/src/simple/jaka_rl/motion_buffer.py``; that module
-imports mujoco/loguru/the ``simple`` package, so if it cannot be imported here a
-byte-equivalent copy of ``_decode_binary_v1`` is used instead (it depends only on
-json + numpy). Re-sync the vendored copy if the authoritative one changes.
-
-Run:
-    python jaka_tabletop_env_test.py
+The reference Python decoder checks the protocol v1 numerical payload. Separate
+assertions cover the metadata required by the Khan SuperZmq C++ receiver.
+Run with `python jaka_tabletop_env_test.py` or pytest.
 """
 
 import json
 import os
+import struct
 import sys
+import tempfile
 import time
+import uuid
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import zmq
@@ -31,6 +30,7 @@ from jaka_tabletop_env import (
     PERM_POLICY_TO_SIM,
     PERM_SIM_TO_POLICY,
     JakaTabletopEnv,
+    validate_base_replay_dataset,
 )
 from sonic_g1_env import _euler_xyz_to_quat_wxyz, pack_pose_message
 
@@ -138,9 +138,10 @@ def test_golden_roundtrip():
         "body_quat_w": np.array([[1.0, 0.0, 0.0, 0.0], [0.9, 0.1, 0.2, 0.3]], dtype=np.float32),
         "frame_index": np.array([7, 8], dtype=np.int64),
     }
-    joint_pos, body_pos_w, body_quat_w, frame_index = decode_binary_v1(
-        pack_pose_message(data, topic="pose", version=1)
-    )
+    packet = pack_pose_message(data, topic="pose", version=1)
+    header = json.loads(packet[4:1284].rstrip(b"\0"))
+    assert set(header) == {"v", "endian", "count", "fields"}  # conventional G1 header
+    joint_pos, body_pos_w, body_quat_w, frame_index = decode_binary_v1(packet)
     assert np.array_equal(joint_pos, data["joint_pos"]), "joint_pos mismatch"
     assert np.array_equal(body_pos_w, data["body_pos_w"]), "body_pos_w mismatch"
     assert np.array_equal(body_quat_w, data["body_quat_w"]), "body_quat_w mismatch"
@@ -189,7 +190,7 @@ def test_anchor_roundtrip():
         np.full(T, 0.05),
     ], axis=1)
     pos = np.zeros((T, 3), dtype=np.float64)
-    pos[0] = (0.0, 0.0, 0.83)
+    pos[0] = (0.0, 0.0, 0.607)
     for i in range(T - 1):
         pos[i + 1] = pos[i] + world_vel[i] * dt
     pos = pos.astype(np.float32)
@@ -274,6 +275,11 @@ def test_live_stream():
 
     msgs = _drain(sub, n_steps - 1)
     assert len(msgs) == n_steps - 1, f"expected {n_steps - 1} messages, got {len(msgs)}"
+    headers = [json.loads(m[4:1284].rstrip(b"\0")) for m in msgs]
+    stream_id = headers[0]["stream_id"]
+    assert uuid.UUID(stream_id).version == 4
+    assert all(h["anchor_body"] == "base_link" and h["joint_order"] == "jaka" and
+               h["stream_id"] == stream_id and h["count"] == 1 for h in headers)
 
     decoded = [decode_binary_v1(m) for m in msgs]
 
@@ -307,7 +313,7 @@ def test_live_stream():
     from scipy.spatial.transform import Rotation
 
     accel = np.array([0.1, 0.2, 0.3], dtype=np.float64)
-    expected_pos = {0: np.array([0.0, 0.0, 0.604])}  # DEFAULT_INITIAL_ANCHOR_POS
+    expected_pos = {0: np.array([0.0, 0.0, 0.604])}  # recorded base_link height default
     for k in range(1, n_steps + 1):
         expected_pos[k] = expected_pos[k - 1] + Rotation.from_euler(
             "xyz", [0.1, 0.2, 0.3 * dt * (k - 1)]).apply(accel) * dt
@@ -335,6 +341,7 @@ def test_live_stream():
     for _ in range(post_reset_steps):
         env.step(action)
     more = _drain(sub, post_reset_steps - 1)
+    assert all(json.loads(m[4:1284].rstrip(b"\0"))["stream_id"] == stream_id for m in more)
     assert len(more) == post_reset_steps - 1, \
         f"expected {post_reset_steps - 1} messages after reset, got {len(more)}"
     post = [decode_binary_v1(m)[3] for m in more]
@@ -355,6 +362,120 @@ def test_live_stream():
     ctx.term()
     print("PASS test_live_stream")
 
+def test_base_contract():
+    with tempfile.TemporaryDirectory() as d:
+        with np.testing.assert_raises_regex(ValueError, "Unknown source anchor"):
+            validate_base_replay_dataset(d)
+        validate_base_replay_dataset(d, assume_base_link=True)
+        p = Path(d) / "conversion_manifest.json"
+        p.write_text(json.dumps({"anchor_body_name": "waist_yaw_Link"}))
+        with np.testing.assert_raises_regex(ValueError, "Cannot publish"):
+            validate_base_replay_dataset(d, assume_base_link=True)
+        p.write_text(json.dumps({"anchor_body_name": "base_link"}))
+        validate_base_replay_dataset(d)
+    options = dict(mock=True, publish=False, initial_anchor_pos=(0.0, 0.0, 0.607))
+    with np.testing.assert_raises_regex(ValueError, "control_hz"):
+        JakaTabletopEnv(**options, control_hz=50)
+    env = JakaTabletopEnv(**options)
+    again = JakaTabletopEnv(**options)
+    try:
+        assert env._pose_metadata["stream_id"] != again._pose_metadata["stream_id"]
+        action = np.zeros(33, dtype=np.float32)
+        action[29] = np.nan
+        with np.testing.assert_raises_regex(ValueError, "nonfinite"):
+            env.step(action)
+        assert env._frame_index == 0 and env._accumulated_yaw == 0 and env._prev_joint_pos is None
+    finally:
+        env.close()
+        again.close()
+
+
+def test_retry_preserves_overlap():
+    env = JakaTabletopEnv(mock=True, publish=False, num_frames_to_send=3)
+    sender = Mock()
+    sender.send.side_effect = [OSError("injected send failure"), None, None]
+    actions = np.arange(4 * 33, dtype=np.float32).reshape(4, 33) * .01
+    try:
+        with patch.object(env, "_zmq_socket", sender):
+            env.step(actions[0])
+            env.step(actions[1])
+            initial_pos = env._body_pos_w.copy()
+            initial_yaw = env._accumulated_yaw
+            with np.testing.assert_raises_regex(OSError, "injected"):
+                env.step(actions[2])
+            assert env._frame_index == 2 and env._accumulated_yaw == initial_yaw
+            np.testing.assert_array_equal(env._body_pos_w, initial_pos)
+
+            env.step(actions[2])
+            env.step(actions[3])
+        failed, retried, following = (call.args[0] for call in sender.send.call_args_list)
+        assert failed == retried
+        first_window = decode_binary_v1(retried)
+        next_window = decode_binary_v1(following)
+        np.testing.assert_array_equal(first_window[3], [0, 1, 2])
+        np.testing.assert_array_equal(next_window[3], [1, 2, 3])
+        for field, next_field in zip(first_window, next_window, strict=True):
+            np.testing.assert_array_equal(field[1:], next_field[:-1])
+    finally:
+        env.close()
+
+
+def test_real_observation_formats():
+    env = JakaTabletopEnv(mock=True, publish=False)
+    pixels = np.array([[[255, 2, 0, 255], [3, 4, 5, 255]]], dtype=np.uint8)
+    joints_sim = np.arange(27, dtype=np.float32)
+    radians = (.1, -.2, .3)
+    packet = {"joint_pos": joints_sim.tolist(), "publish_t_ns": 123,
+              "body_quat_w": [_euler_xyz_to_quat_wxyz(*radians).tolist()]}
+    try:
+        with patch.object(env, "_head_sub") as camera, patch.object(env, "_state_sub") as state:
+            camera.recv.return_value = struct.pack("iii", 2, 1, 4) + pixels.tobytes()
+            state.recv.return_value = json.dumps(packet).encode()
+            head, observed = env._poll_observation()
+            np.testing.assert_array_equal(head, pixels[..., :3])
+            np.testing.assert_array_equal(observed[0], joints_sim[PERM_SIM_TO_POLICY])
+            np.testing.assert_allclose(observed[1:], radians, atol=1e-6)
+            assert env._poll_observation()[1] is None  # replayed publisher timestamp
+            # Waiting at the operator prompt must not make this old state fresh again.
+            env.mock = False
+            env._last_observation_poll = 1.0
+            with patch("jaka_tabletop_env.time.monotonic", side_effect=[2.0, 2.5]), \
+                 np.testing.assert_raises_regex(TimeoutError, "state"):
+                env.get_observation()
+    finally:
+        env.close()
+
+
+def test_sensor_observations():
+    # Staggered packets, a held state, and a camera outage on a deterministic clock.
+    env = JakaTabletopEnv(mock=True, publish=False, initial_anchor_pos=(0., 0., 0.607))
+    env.mock = False
+    image = np.full((4, 6, 3), 150, dtype=np.uint8)
+    state = (np.arange(27, dtype=np.float32), .2, -.1, .25)
+    pending = [(None, None), (image, None), (None, state)]
+    clock = [10.0]
+    def advance(dt):
+        clock[0] += dt
+
+    try:
+        with patch.object(env, "_poll_observation", side_effect=lambda: pending.pop(0) if pending else (None, None)), \
+             patch("jaka_tabletop_env.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("jaka_tabletop_env.time.sleep", side_effect=advance):
+            a = env.get_observation()
+            assert a["head_image_left"] is image and a["state"][29] == 0
+            advance(.04)
+            pending.append((None, (*state[:3], .27)))
+            b = env.get_observation()
+            assert b["head_image_left"] is image
+            np.testing.assert_allclose(b["state"][29], .5)
+            advance(.04)
+            assert env.get_observation()["state"][29] == 0  # same pose on the next tick
+            advance(.25)
+            with np.testing.assert_raises_regex(TimeoutError, "head_image_left"):
+                env.get_observation()
+    finally:
+        env.close()
+
 
 if __name__ == "__main__":
     print(f"decoder under test: {DECODER_SOURCE}")
@@ -363,4 +484,8 @@ if __name__ == "__main__":
     test_golden_roundtrip()
     test_anchor_roundtrip()
     test_live_stream()
+    test_base_contract()
+    test_sensor_observations()
+    test_real_observation_formats()
+    test_retry_preserves_overlap()
     print("\nAll jaka wire-contract tests passed.")

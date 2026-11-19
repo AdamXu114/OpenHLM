@@ -2,13 +2,12 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import TYPE_CHECKING
 
 import tyro
 
-from openpi.policies import policy as _policy
-from openpi.policies import policy_config as _policy_config
-from openpi.serving import websocket_policy_server
-from openpi.training import config as _config
+if TYPE_CHECKING:
+    from openpi.policies import policy as _policy
 
 
 class EnvMode(enum.Enum):
@@ -90,32 +89,36 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi05_g1_pick_sprite_turnback",
         dir="checkpoints/pi05_g1_pick_sprite/g1_pick_sprite_bs64/20000",
     ),
-    # Trained with: scripts/train_pytorch.py jaka_tabletop_pick
-    #                   --exp-name jaka_tabletop_pick_v1 --save-interval 5000
-    # Adjust the step to match the checkpoint you actually want to serve.
-    EnvMode.JAKA: Checkpoint(
-        config="jaka_tabletop_pick",
-        dir="checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000",
-    ),
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, num_steps: int = 10) -> _policy.Policy:
+def _load_checkpoint(checkpoint: Checkpoint, *, default_prompt: str | None, num_steps: int) -> "_policy.Policy":
+    from openpi.policies import policy_config
+    from openpi.training import config
+
+    return policy_config.create_trained_policy(
+        config.get_config(checkpoint.config), checkpoint.dir,
+        default_prompt=default_prompt, sample_kwargs={"num_steps": num_steps},
+    )
+
+
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, num_steps: int = 10) -> "_policy.Policy":
     """Create a default policy for the given environment."""
-    if checkpoint := DEFAULT_CHECKPOINT.get(env):
-        return _policy_config.create_trained_policy(
-             _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt, sample_kwargs={"num_steps": num_steps}
+    if env == EnvMode.JAKA:
+        raise ValueError(
+            "JAKA requires an explicit checkpoint trained on base_link data. Use "
+            "policy:checkpoint --policy.config jaka_tabletop_pick --policy.dir <checkpoint>"
         )
+    if checkpoint := DEFAULT_CHECKPOINT.get(env):
+        return _load_checkpoint(checkpoint, default_prompt=default_prompt, num_steps=num_steps)
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
-def create_policy(args: Args) -> _policy.Policy:
+def create_policy(args: Args) -> "_policy.Policy":
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
-            return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt, sample_kwargs={"num_steps": args.num_steps}
-            )
+            return _load_checkpoint(args.policy, default_prompt=args.default_prompt, num_steps=args.num_steps)
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt, num_steps=args.num_steps)
 
@@ -135,11 +138,15 @@ def main(args: Args) -> None:
 
     # Record the policy's behavior.
     if args.record:
+        from openpi.policies import policy as _policy
+
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+
+    from openpi.serving import websocket_policy_server
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,

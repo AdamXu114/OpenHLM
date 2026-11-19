@@ -118,13 +118,9 @@ export HF_LEROBOT_HOME=/workspace/OpenHLM/data
 
 **处理**：喂 stdin，如 `<<< $'s\nn\n'`。
 
-### 下游轨迹"静默冻结"
+### 下游等待新参考
 
-`frame_index` 被重置了。接收方的去重基线在它自己 `clear()` 之后依然存在，
-所以**客户端重启会让参考轨迹静默冻结**（不报错）。
-
-**处理**：`JakaTabletopEnv.reset()` 里**故意不复位** `_frame_index` / `_accumulated_yaw` / `_body_pos_w`。
-改这段代码时不要"顺手"加上复位。
+检查发布器是否仍在同一个 `stream_id` 内持续发送新 `frame_index`。同一实例的 `reset()` 清滑窗并保留编号和积分姿态。新实例会分配新流 ID，应按实时控制器的新流接入规则从新的 base_link 初始姿态开始。
 
 ### 改了发布协议后行为异常
 
@@ -134,7 +130,7 @@ export HF_LEROBOT_HOME=/workspace/OpenHLM/data
 
 检查三点：`anchor_lin_vel` 是否**先做了 anchor quat 旋转**再积分（它是 body 系速度，不是世界速度）；
 发布帧的四元数是否用的是**该帧 `yaw_vel` 生效前**的累加 yaw；
-`--jaka-initial-anchor-pos` 的 **z 是否合理**（站立约 0.83）。
+`--jaka-initial-anchor-pos` 的 **z 是否合理**（应取当前起始姿态的 base_link 高度）。
 
 ---
 

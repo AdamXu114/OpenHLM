@@ -188,12 +188,7 @@ ModuleNotFoundError: No module named 'simple.jaka_rl.math'  ← 仓库内缺失
 
 ## 6. 最小可跑清单
 
-**只做部署（不改代码）**：
-
-1. HF 下载 `upload` → 解包出 `30000/`（含 `model.safetensors` + `assets/`）
-2. `serve_policy.py --env JAKA --num-steps 10`
-3. `main.py --env jaka_tabletop_pick ...`（`PYTHONPATH` 指向 GR00T 根）
-4. 下游接收端：需要 **SIMPLE-jaka-main**（外部项目），本仓库的 `motion_buffer.py` 不可直接运行
+本页记录旧仿真模型的文件核对结果。部署当前实机模型 `jaka_pick_real_v1/30000` 的文件、启动参数和 SuperZmq 配置见 [11 本机部署](11-local-deploy.md)。
 
 **要训练/复现**：还需要 §3 的原始录制 + 合并数据集 + `pi05_base_pytorch` 基座权重
 （本机已按 [08-local-machine.md](08-local-machine.md) 下载转换到

@@ -15,10 +15,9 @@ Action layout produced by ``JakaOutputs`` (policy order, arms first)::
     27-29  anchor: roll (absolute), pitch (absolute), yaw_vel (angular velocity)
     30-32  anchor_lin_vel x/y/z -- **in the ANCHOR BODY FRAME**, not world
 
-The anchor fields describe the reference anchor (``base_link`` -- the body the
-tracker's ``root_pos_diff_b`` / ``anchor_ori`` are built around), which is also the
-frame the reference joints are commanded in. The world pose is not carried on the
-wire: it is re-integrated here from the per-frame velocity + orientation, exactly as
+Khan real-robot VLA deployments use the reference anchor ``base_link``.
+The 33-D action supplies rates. The outgoing wire carries the world pose
+integrated from those rates and the configured starting pose, exactly as
 ``implement_action_analysis/action_trunk_reconstruct.py::reconstruct_anchor_motion``
 does offline::
 
@@ -31,17 +30,17 @@ Note the ordering: each published frame is a snapshot of the pose at the *start*
 its interval, so the quat is built from the accumulated yaw **before** this frame's
 ``yaw_vel`` is applied. See ``JAKA_RECORDED_DATA_REFERENCE.md`` section 4.
 
-The downstream reference buffer (``RealtimeMotionBufferVla``, from
-``implement_action_analysis/src/simple/jaka_rl/motion_buffer.py``) subscribes to
-binary protocol v1 over ZMQ and expects the 27 joints in MuJoCo/SIM order (legs
-first), the anchor (``base_link``) world pose, and a strictly monotonic
-``frame_index`` -- see ``implementation_analysis.md`` section 5.3.
+The SuperZmq C++ receiver expects binary protocol v1 with 27 joints in JAKA
+order (legs first), the world pose of base_link and a stream_id. The same
+source frame keeps its frame_index when it appears in overlapping packets.
 """
 
 import json
 import struct
 import time
-from collections import defaultdict, deque
+import uuid
+from collections import deque
+from pathlib import Path
 
 import numpy as np
 import zmq
@@ -75,7 +74,7 @@ POLICY_JOINT_NAMES = [
 
 # MuJoCo/SIM order required on the wire (legs first) -- the same names, as
 # recorded in the raw teleop sessions, reordered by
-# ``merge_teleop_jaka_mf.py::reorder``. The receiver does NOT reorder.
+# ``merge_teleop_jaka_mf.py::reorder``. SuperZmq maps this wire order to its buffer order.
 SIM_JOINT_NAMES = [
     # left leg (6)
     "Left_hip_pitch_joint", "Left_hip_roll_joint", "Left_hip_yaw_joint",
@@ -168,7 +167,20 @@ DEFAULT_STATE_JAKA = np.array([
 # The yaw seed only sets the heading offset: the receiver re-aligns the reference yaw
 # to the live robot on its first frame (`align_quat`).
 DEFAULT_INITIAL_ANCHOR_POS = (0.0, 0.0, 0.604)
+JAKA_ANCHOR_BODY = "base_link"
 DEFAULT_INITIAL_ANCHOR_RPY = (0.0, 0.0, 0.0)
+
+
+def validate_base_replay_dataset(root: str, *, assume_base_link: bool = False) -> None:
+    """Check the source pose semantics before publishing labelled base references."""
+    p = Path(root) / "conversion_manifest.json"
+    anchor = json.loads(p.read_text()).get("anchor_body_name") if p.is_file() else None
+    if anchor == JAKA_ANCHOR_BODY or (anchor is None and assume_base_link):
+        return
+    if anchor is None:
+        raise ValueError("Unknown source anchor: use a Khan base_link conversion_manifest.json or "
+                         "explicitly pass --assume-base-link after verifying the original poses")
+    raise ValueError(f"Cannot publish {anchor!r} poses as base_link; convert the source poses first")
 
 
 class JakaTabletopEnv:
@@ -193,6 +205,8 @@ class JakaTabletopEnv:
         initial_anchor_pos: tuple = DEFAULT_INITIAL_ANCHOR_POS,
         initial_anchor_rpy: tuple = DEFAULT_INITIAL_ANCHOR_RPY,
         publish: bool = True,
+        observation_max_age_s: float = 0.30,
+        observation_start_timeout_s: float = 3.0,
     ):
         """
         Args:
@@ -201,20 +215,32 @@ class JakaTabletopEnv:
                 connected (the action PUB socket is still bound, so the whole
                 downstream stream can be exercised offline).
             motion_zmq_address / motion_zmq_port: Bind address of the action PUB
-                socket. The receiver connects to ``tcp://127.0.0.1:28701``.
+                socket. SuperZmq connects to the publishing PC on this port.
             state_address / state_port: Source of the 30-dim state. Defaults to
-                SIMPLE's ``JakaTeleopZmqPublisher.state_zmq_bind`` (28711).
+                the robot state publisher (28711).
             head_image_address / head_image_port: Source of the head camera
-                image. Defaults to SIMPLE's ``camera_zmq_bind`` (28712).
+                image. Defaults to the robot camera publisher port (28712).
             num_frames_to_send: Frames buffered per ZMQ message (2 = sliding
                 window ``[i-1, i]``, matching the receiver's dedup contract).
-            initial_anchor_pos: Anchor (``base_link``) initial world position.
+            initial_anchor_pos: Initial base_link world position (metres).
                 Only z is semantically load-bearing (it is the tracker's absolute
                 ``root_z_mf``); x/y merely fix an arbitrary translation origin.
             initial_anchor_rpy: Anchor initial roll/pitch/yaw in radians (only the
                 yaw seed matters -- it is accumulated from ``yaw_vel``).
             publish: If False, no ZMQ socket is bound at all.
         """
+        if control_hz != 30 or not 2 <= num_frames_to_send <= 16:
+            raise ValueError("Khan base_link expects control_hz=30 and 2..16 frames per sliding window")
+        if not all(np.isfinite(x) and x > 0 for x in (observation_max_age_s, observation_start_timeout_s)):
+            raise ValueError("Observation freshness and startup timeouts must be positive and finite")
+        self._pose_metadata = {"anchor_body": JAKA_ANCHOR_BODY, "joint_order": "jaka", "stream_id": str(uuid.uuid4())}
+        for value in (initial_anchor_pos, initial_anchor_rpy):
+            if np.shape(value) != (3,) or not np.isfinite(np.asarray(value, dtype=np.float32)).all():
+                raise ValueError("Initial anchor position and RPY must each have three finite components")
+        self._observation_max_age = observation_max_age_s
+        self._observation_start_timeout = observation_start_timeout_s
+        self._latest_observations = {}
+        self._last_observation_poll = None
         self.mock = mock
         self.control_hz = control_hz
         self._dt = 1.0 / float(control_hz)
@@ -223,11 +249,9 @@ class JakaTabletopEnv:
         self.state_dim = 30   # 27 joints (policy order) + root(3)
 
         self._num_frames_to_send = num_frames_to_send
-        self._action_frame_buffer = defaultdict(lambda: deque(maxlen=num_frames_to_send))
+        self._action_frame_buffer = deque(maxlen=num_frames_to_send - 1)
 
-        # frame_index is monotonic for the lifetime of the process: the receiver
-        # keeps its dedup baseline across ``clear()``, so resetting it here would
-        # make every subsequent frame silently dropped downstream.
+        # One timeline per publisher instance. Each overlapping window carries its stream_id.
         self._frame_index = 0
         self._prev_joint_pos = None
 
@@ -235,8 +259,6 @@ class JakaTabletopEnv:
         # only yaw is accumulated from yaw_vel, and the position is integrated
         # from anchor_lin_vel. Both survive reset() so the reference trajectory
         # does not jump between episodes.
-        self._initial_roll = float(initial_anchor_rpy[0])
-        self._initial_pitch = float(initial_anchor_rpy[1])
         self._accumulated_yaw = float(initial_anchor_rpy[2])
         self._body_pos_w = np.asarray(initial_anchor_pos, dtype=np.float32).copy()
 
@@ -248,9 +270,8 @@ class JakaTabletopEnv:
         else:
             self._zmq_socket = None
 
-        # Observation channels -- these match SIMPLE's ``JakaTeleopZmqPublisher``
-        # (``jaka_zmq_pub.py``) verbatim, which is what the teleop/recorder process
-        # already publishes while the Jaka robot runs under it:
+        # Protocols shared by the real robot's StatePublisher and cam_pub.py
+        # and SIMPLE's simulated JakaTeleopZmqPublisher:
         #
         #   state  (:28711, ``state_zmq_bind``) -- raw JSON, NO topic prefix:
         #     {"publish_t_ns": i64, "smplx_t_ns": i64, "paused": bool, "seq": i64,
@@ -276,12 +297,8 @@ class JakaTabletopEnv:
             self._state_sub.connect(f"tcp://{state_address}:{state_port}")
             self._head_sub.connect(f"tcp://{head_image_address}:{head_image_port}")
 
-        # ``yaw_vel`` is not carried on the wire: it is differentiated here from
-        # ``base_link``'s world yaw, exactly like the recording side's
-        # ``OpenHLMRootVel`` (wrapped difference / wall-clock delta; 0.0 on the
-        # first frame). State lives here because it is a per-stream derivative.
-        self._prev_raw_yaw: float | None = None
-        self._prev_state_t_ns: int | None = None
+        self._last_state_publish_ns = None
+        self._previous_observed_yaw = None  # (local monotonic time, yaw) of selected state
 
     # ------------------------------------------------------------------
     # Action path
@@ -292,6 +309,8 @@ class JakaTabletopEnv:
         action = np.asarray(action, dtype=np.float32)
         if action.shape != (self.action_dim,):
             raise ValueError(f"Action shape must be ({self.action_dim},), got {action.shape}")
+        if not np.isfinite(action).all():
+            raise ValueError("JAKA action contains nonfinite values")
 
         # 1) Reorder the 27 joints from policy order (arms first) to SIM order (legs first).
         joint_pos = action[0:27][PERM_POLICY_TO_SIM]
@@ -302,7 +321,6 @@ class JakaTabletopEnv:
             joint_vel = np.zeros(27, dtype=np.float32)
         else:
             joint_vel = ((joint_pos - self._prev_joint_pos) / self._dt).astype(np.float32)
-        self._prev_joint_pos = joint_pos.copy()
 
         # 3) Anchor orientation: roll/pitch are absolute, yaw accumulates yaw_vel.
         #    The quat is built from the yaw BEFORE this frame's yaw_vel is applied --
@@ -316,71 +334,66 @@ class JakaTabletopEnv:
         # 4) Anchor position: anchor_lin_vel is a velocity in the ANCHOR BODY frame, so
         #    it must go through the anchor orientation before being integrated.
         world_vel = _quat_rotate_wxyz(body_quat_w, action[30:33])
+        next_pos = (self._body_pos_w + world_vel * self._dt).astype(np.float32)
+        next_yaw = self._accumulated_yaw + yaw_vel * self._dt
+        if not np.isfinite(joint_vel).all() or not np.isfinite(next_pos).all() or not np.isfinite(next_yaw):
+            raise ValueError("JAKA action produced a nonfinite velocity or integrated pose")
 
         # 5) Buffer into the sliding window and publish once it is full.
         self._send_motion_zmq(joint_pos, joint_vel, self._body_pos_w.copy(), body_quat_w)
 
         # 6) Advance the anchor state for the NEXT frame.
-        self._body_pos_w = (self._body_pos_w + world_vel * self._dt).astype(np.float32)
-        self._accumulated_yaw += yaw_vel * self._dt
+        self._prev_joint_pos = joint_pos.copy()
+        self._body_pos_w = next_pos
+        self._accumulated_yaw = next_yaw
 
     def _send_motion_zmq(self, joint_pos, joint_vel, body_pos_w, body_quat_w) -> None:
         """Append one frame to the window and publish it once the window is full."""
-        buf = self._action_frame_buffer
-        buf["joint_pos"].append(np.asarray(joint_pos, dtype=np.float32))
-        buf["joint_vel"].append(np.asarray(joint_vel, dtype=np.float32))
-        buf["body_pos_w"].append(np.asarray(body_pos_w, dtype=np.float32))
-        buf["body_quat_w"].append(np.asarray(body_quat_w, dtype=np.float32))
-        buf["frame_index"].append(self._frame_index)
-        self._frame_index += 1
-
-        if len(buf["frame_index"]) < self._num_frames_to_send:
-            return  # first step only fills the window
-
-        numpy_data = {
-            "joint_pos": np.stack(buf["joint_pos"], axis=0),              # (N, 27) f32
-            "joint_vel": np.stack(buf["joint_vel"], axis=0),              # (N, 27) f32
-            "body_pos_w": np.stack(buf["body_pos_w"], axis=0),            # (N, 3)  f32
-            "body_quat_w": np.stack(buf["body_quat_w"], axis=0),          # (N, 4)  f32
-            "frame_index": np.array(buf["frame_index"], dtype=np.int64),  # (N,)    i64
+        frame = {
+            "joint_pos": joint_pos,
+            "joint_vel": joint_vel,
+            "body_pos_w": body_pos_w,
+            "body_quat_w": body_quat_w,
+            "frame_index": np.int64(self._frame_index),
         }
+        if self._zmq_socket is not None and len(self._action_frame_buffer) + 1 == self._num_frames_to_send:
+            window = [*self._action_frame_buffer, frame]
+            arrays = {key: np.stack([item[key] for item in window]) for key in frame}
+            self._zmq_socket.send(pack_pose_message(arrays, metadata=self._pose_metadata))
 
-        if self._zmq_socket is not None:
-            try:
-                self._zmq_socket.send(pack_pose_message(numpy_data, topic="pose", version=1))
-            except Exception as e:  # noqa: BLE001 - keep the control loop alive
-                print(f"Error sending motion via ZMQ: {e}")
+        # Commit the frame only after send() succeeds, so a retry reproduces the same overlap.
+        self._action_frame_buffer.append(frame)
+        self._frame_index += 1
 
     # ------------------------------------------------------------------
     # Observation path
     # ------------------------------------------------------------------
 
     def reset(self, default_pose=None):
-        """Clear the 2-frame window and return a fresh observation.
+        """Clear the send window and return a fresh observation.
 
-        ``_frame_index``, ``_accumulated_yaw`` and ``_body_pos_w`` are deliberately
-        kept: the receiver's dedup baseline survives its own ``clear()`` (a reset
-        frame_index would be dropped forever), and the anchor trajectory must stay
-        continuous across episodes.
+        The same publisher retains its stream ID, frame indices and integrated
+        pose. A new publisher instance starts a separate trajectory.
 
         Args:
             default_pose: Accepted for interface parity with SonicG1Env; unused.
         """
         self._action_frame_buffer.clear()
         self._prev_joint_pos = None
+        self._previous_observed_yaw = None
         return self.get_observation()
 
     def _poll_observation(self):
-        """Non-blocking drain of SIMPLE's state (:28711) and camera (:28712) channels."""
+        """Non-blocking reads of the state (:28711) and camera (:28712) channels."""
         head = None
         try:
             buf = self._head_sub.recv(zmq.NOBLOCK)
             if len(buf) >= 12:
                 w, h, c = struct.unpack("iii", buf[:12])
                 payload = buf[12:]
-                if len(payload) == w * h * c and c in (3, 4):
+                if w > 0 and h > 0 and len(payload) == w * h * c and c in (3, 4):
                     img = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, c))
-                    head = img[..., :3] if c == 4 else img  # BGRA -> RGB
+                    head = img[..., :3] if c == 4 else img  # RGB(A) -> RGB
                 else:
                     print(
                         f"Error reading jaka head image: header says {w}x{h}x{c} "
@@ -399,41 +412,68 @@ class JakaTabletopEnv:
             m = json.loads(raw.decode("utf-8"))
 
             joints_sim = np.asarray(m["joint_pos"], dtype=np.float32)
-            if joints_sim.shape != (27,):
-                raise ValueError(f"jaka state joint_pos must be (27,), got {joints_sim.shape}")
+            if joints_sim.shape != (27,) or not np.isfinite(joints_sim).all():
+                raise ValueError("jaka state requires 27 finite joint positions")
 
             # base_link is body 0 in both orderings; roll/pitch are absolute, and
             # yaw_vel is differentiated here (see __init__).
             quat_wxyz = np.asarray(m["body_quat_w"][0], dtype=np.float64)
             n = float(np.linalg.norm(quat_wxyz))
-            if n < 1e-6:
+            if quat_wxyz.shape != (4,) or not np.isfinite(n) or n < 1e-6:
                 raise ValueError("jaka state body_quat_w[0] is degenerate")
             quat_wxyz /= n
 
             t_ns = int(m.get("publish_t_ns") or m.get("smplx_t_ns") or 0)
+            if t_ns <= 0 or (self._last_state_publish_ns is not None and t_ns <= self._last_state_publish_ns):
+                raise ValueError("base_link state requires an advancing publisher timestamp")
             roll, pitch, raw_yaw = R.from_quat(
                 [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
             ).as_euler("xyz")
 
-            yaw_vel = 0.0
-            if self._prev_raw_yaw is not None and self._prev_state_t_ns is not None:
-                dt = (t_ns - self._prev_state_t_ns) * 1e-9
-                if dt > 0.0:
-                    d_yaw = (raw_yaw - self._prev_raw_yaw + np.pi) % (2.0 * np.pi) - np.pi
-                    yaw_vel = float(d_yaw / dt)
-            self._prev_raw_yaw = float(raw_yaw)
-            self._prev_state_t_ns = t_ns
-
-            state = np.concatenate([
-                joints_sim[PERM_SIM_TO_POLICY],
-                np.array([float(roll), float(pitch), yaw_vel], dtype=np.float32),
-            ])
+            self._last_state_publish_ns = t_ns
+            state = (joints_sim[PERM_SIM_TO_POLICY], roll, pitch, raw_yaw)
         except zmq.Again:
             pass
         except Exception as e:  # noqa: BLE001
             print(f"Error reading jaka state: {e}")
 
         return head, state
+
+    def _fresh_base_observation(self):
+        """Use local receipt ages for independently arriving camera and state samples."""
+        now = time.monotonic()
+        if self._last_observation_poll is None or now - self._last_observation_poll > self._observation_max_age:
+            # CONFLATE may retain a frame indefinitely during a pause in polling.
+            # Discard pending packets once, then wait for both channels to deliver.
+            self._poll_observation()
+            self._latest_observations.clear()
+            # Keep the publisher timestamp watermark across gaps in local polling.
+            self._previous_observed_yaw = None
+        wait = self._observation_start_timeout if self._last_observation_poll is None else self._observation_max_age
+        deadline = now + wait
+        keys = ("head_image_left", "state")
+        while True:
+            pair = self._poll_observation()
+            now = self._last_observation_poll = time.monotonic()
+            for key, value in zip(keys, pair, strict=True):
+                if value is not None:
+                    self._latest_observations[key] = (value, now)
+            stale = [key for key in keys if key not in self._latest_observations
+                     or now - self._latest_observations[key][1] > self._observation_max_age]
+            if not stale:
+                joints, roll, pitch, yaw = self._latest_observations["state"][0]
+                yaw_rate = 0.0
+                if self._previous_observed_yaw is not None:
+                    prev_t, prev_yaw = self._previous_observed_yaw
+                    dt = now - prev_t
+                    if dt > 0:
+                        yaw_rate = ((yaw - prev_yaw + np.pi) % (2 * np.pi) - np.pi) / dt
+                self._previous_observed_yaw = (now, yaw)
+                state = np.concatenate((joints, np.asarray([roll, pitch, yaw_rate], dtype=np.float32)))
+                return {"head_image_left": self._latest_observations["head_image_left"][0], "state": state}
+            if now >= deadline:
+                raise TimeoutError(f"No fresh {' and '.join(stale)} for JAKA base_link inference")
+            time.sleep(min(0.002, deadline - now))
 
     def get_observation(self):
         """Return ``{"head_image_left": (H, W, 3) uint8 RGB, "state": (30,) float32}``.
@@ -449,24 +489,16 @@ class JakaTabletopEnv:
             )
             state = np.random.uniform(-1.0, 1.0, size=(self.state_dim,)).astype(np.float32)
         else:
-            head, state = self._poll_observation()
-            if head is None:
-                head = np.zeros(
-                    (HEAD_IMAGE_HEIGHT, HEAD_IMAGE_WIDTH, HEAD_IMAGE_CHANNELS), dtype=np.uint8
-                )
-            if state is None:
-                state = np.zeros(self.state_dim, dtype=np.float32)
-            head_image_left = np.asarray(head, dtype=np.uint8)
-            state = np.asarray(state, dtype=np.float32)
+            return self._fresh_base_observation()
 
         return {"head_image_left": head_image_left, "state": state}
 
     def close(self):
-        """Close sockets and terminate the ZMQ context."""
+        """Close sockets without flushing stale reference frames on shutdown."""
         for attr in ("_zmq_socket", "_state_sub", "_head_sub"):
             sock = getattr(self, attr, None)
             if sock is not None:
-                sock.close()
+                sock.close(linger=0)
         if getattr(self, "_zmq_context", None) is not None:
             self._zmq_context.term()
             self._zmq_context = None

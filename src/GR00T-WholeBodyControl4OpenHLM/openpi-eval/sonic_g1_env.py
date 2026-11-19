@@ -98,16 +98,20 @@ DEFAULT_MIMIC_OBS_G1_RAISED = np.concatenate([
 _HEADER_SIZE = 1280
 
 
-def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
+def _build_header(fields: list, version: int = 1, count: int = 1, *, metadata: dict | None = None) -> bytes:
     """Build a fixed-size JSON header for ZMQ wire-format messages."""
     header = {"v": version, "endian": "le", "count": count, "fields": fields}
+    if metadata:
+        if header.keys() & metadata.keys():
+            raise ValueError("Pose metadata cannot replace protocol fields")
+        header.update(metadata)
     header_json = json.dumps(header, separators=(",", ":")).encode("utf-8")
     if len(header_json) > _HEADER_SIZE:
         raise ValueError(f"Header too large: {len(header_json)} > {_HEADER_SIZE}")
     return header_json.ljust(_HEADER_SIZE, b"\x00")
 
 
-def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 1) -> bytes:
+def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 1, *, metadata: dict | None = None) -> bytes:
     """Pack a dict of numpy arrays into a ZMQ wire-format message.
 
     Message layout: [topic_bytes][fixed JSON header][packed binary payload].
@@ -116,6 +120,7 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 1) ->
         pose_data: Dict mapping field names to numpy arrays.
         topic: Topic prefix string.
         version: Protocol version written into the header.
+        metadata: Optional stream metadata added alongside the protocol fields.
 
     Returns:
         Packed message bytes ready to send via ``socket.send()``.
@@ -146,7 +151,7 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 1) ->
             value = value.astype(value.dtype.newbyteorder("<"))
         binary_parts.append(value.tobytes())
 
-    header_bytes = _build_header(fields, version=version, count=1)
+    header_bytes = _build_header(fields, version=version, count=1, metadata=metadata)
     return topic.encode("utf-8") + header_bytes + b"".join(binary_parts)
 
 

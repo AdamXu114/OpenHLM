@@ -1,7 +1,7 @@
 # 10 Jaka 全链路教程：从数据到训练再到部署
 
 > 目标：把 Jaka 桌面抓取任务从**实机采集的数据**一路做到**机器人上跑 VLA 策略**。
-> 命令都在本机（RTX 3090 / Ubuntu 24.04）验证过；路径以 `~/workspace/OpenHLM` 为根。
+> 部署命令对应实机 `base_link` 模型，启动和验证细节见 [11 本机部署](11-local-deploy.md)。路径以 `~/workspace/OpenHLM` 为根。
 >
 > 相关细节：[02 数据](02-data.md) · [03 训练](03-training.md) · [04 部署](04-deployment.md) ·
 > [05 排错](05-troubleshooting.md) · [09 Jaka 文件核对](09-jaka-missing-files.md)
@@ -200,7 +200,9 @@ watch -n 2 nvidia-smi
 ```bash
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py \
-  --env JAKA --num-steps 10
+  --env JAKA --num-steps 10 \
+  policy:checkpoint --policy.config=jaka_tabletop_pick \
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 ```
 
 看到 `server listening on 0.0.0.0:8000` 即可 `Ctrl+C`。
@@ -224,16 +226,18 @@ PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM \
 | --- | --- | --- |
 | `8000` | 客户端 → 服务端 | websocket + msgpack，请求观测 / 返回动作 chunk |
 | `28701` | 客户端 → 机器人 | 协议 v1 二进制动作帧（2 帧滑窗，30 Hz） |
-| `28711` | 观测 → 客户端 | state（裸 JSON，可选） |
-| `28712` | 观测 → 客户端 | head 图（`[w,h,c]` int32 头 + RGB，可选） |
+| `28711` | 观测 → 客户端 | 实测 state（裸 JSON） |
+| `28712` | 观测 → 客户端 | head 图（`[w,h,c]` int32 头 + RGB） |
 
-观测通道没有发布方时，客户端退化为全零 state + 黑图——链路照跑，但策略看不到画面。
+实机客户端等待这两路有效观测，持续缺失会报告超时。离线合成观测使用 `--mock`。
 
 ### 5.2 起服务端（终端 1 / tmux 窗口 1）
 
 ```bash
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
-CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
+  policy:checkpoint --policy.config=jaka_tabletop_pick \
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 ```
 
 ### 5.3 起客户端（终端 2 / tmux 窗口 2）
@@ -245,9 +249,9 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 ~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
   --env jaka_tabletop_pick \
   --remote-host 127.0.0.1 --remote-port 8000 \
+  --jaka-state-address "${ROBOT_IP:?请设置机器人 IP}" --jaka-head-image-address "${CAMERA_IP:-$ROBOT_IP}" \
   --jaka-motion-zmq-port 28701 \
-  --max-steps 100000 \
-  <<< $'s\n'
+  --max-steps 100000
 ```
 
 - 机器人还没接：加 `--mock --use-fake-policy` 可空跑控制循环；
@@ -258,22 +262,16 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 客户端发出的是 **协议 v1**：
 
 ```
-[可选 topic "pose"(4B)][1280B JSON 头，\0 填充][按头中字段顺序拼接的二进制负载]
+[topic "pose"(4B)][1280B JSON 头，\0 填充][按头中字段顺序拼接的二进制负载]
 必需字段：joint_pos(N,27) f32 | frame_index(N,) i64 | body_pos_w(N,3) f32 | body_quat_w(N,4) f32(wxyz)
 ```
 
 要点：
 
 - `joint_pos` 是 **SIM/MuJoCo 关节序（腿优先）**，客户端已重排好；
-- `body_*` 只带 anchor（`waist_yaw_Link`）世界位姿；
-- `frame_index` **单调递增**，接收方按它去重；客户端重启会让 `frame_index` 从 0 开始，
-  此时接收方必须同时重置去重基线，否则会静默丢帧；
-- 每块 25 步开环 ≈120 ms 没有数据是**正常**的，接收方应把 >50 ms 的间隙当作推理停顿重锚时间轴，
-  **不要**用 filler 帧填满。
-
-参考实现（协议解码 + 播放时钟）在本仓库
-`src/GR00T-WholeBodyControl4OpenHLM/implement_action_analysis/src/simple/jaka_rl/motion_buffer.py`，
-但它依赖 SIMPLE 的其它模块，只能当参考；实际接收方按协议自己实现即可。
+- `body_*` 描述 `base_link` 世界位姿，包头声明 `joint_order=jaka` 和发布实例的 `stream_id`；
+- 同一实例跨推理块保留帧号和积分姿态。控制器依帧号构建 30 Hz 源时间轴，短暂停包时窗口可以暂时固定；
+- 机器人进入 `jakaminimimic_superzmq`，用 `motion_backend: vla_pose_v1` 连接客户端 PC 的 28701。新会话或默认连续 1 s 没有新帧会锁存参考。复位后重新开始任务的步骤见 [11 本机部署](11-local-deploy.md)。
 
 ---
 
@@ -282,20 +280,22 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 ```bash
 # 终端 1：服务端
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
-CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10
+CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
+  policy:checkpoint --policy.config=jaka_tabletop_pick \
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 
 # 终端 2：客户端（等终端 1 打印 listening 后再起）
 cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
 export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 ~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
   --env jaka_tabletop_pick --remote-host 127.0.0.1 --remote-port 8000 \
-  --jaka-motion-zmq-port 28701 --max-steps 100000 <<< $'s\n'
+  --jaka-state-address "${ROBOT_IP:?请设置机器人 IP}" --jaka-head-image-address "${CAMERA_IP:-$ROBOT_IP}" \
+  --jaka-motion-zmq-port 28701 --max-steps 100000
 
-# 终端 3（机器人侧）：启动接收方，订阅 tcp://127.0.0.1:28701
+# 机器人端先进入 SuperZmq，订阅 tcp://<客户端 PC 的 IP>:28701，并发布 state；相机另行启动。
 ```
 
-停止：客户端 `Ctrl+C`（回初始位姿）→ 服务端 `Ctrl+C`。
-**尽量一次把 `--max-steps` 开大**，中途重启客户端会触发 `frame_index` 归零问题。
+停止本轮参考发布后，按客户端提示输入 `n` 退出。机器人复位并开始新任务时，从新的初始位姿重启客户端并重新进入 SuperZmq。
 
 ---
 
@@ -321,7 +321,7 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 3. **误加 `--use-8bit-adam`** → 不需要，默认 bf16 参数 + bf16 AdamW 状态就是 16-bit
 4. **`HF_LEROBOT_HOME` 没设** → 数据集找不到（lerobot 不认 `LEROBOT_HOME`）
 5. **`cv2.imshow` 报 function not implemented** → headless OpenCV，见 [08](08-local-machine.md)
-6. **客户端重启导致参考轨迹静默冻结** → `frame_index` 归零，接收方要去重基线同步重置
+6. **客户端重启后参考锁存** → 新的 `stream_id` 表示新的积分原点，需退出并重新进入 SuperZmq
 7. **8000 端口 `address already in use`** → 多半是 TIME_WAIT，等 1 分钟或换端口
 
 ---
@@ -350,12 +350,15 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline PYTHONUNBUFFERED=1 \
   2>&1 | tee logs/jaka_v1_$(date +%m%d_%H%M).log
 
 # 服务端
-CUDA_VISIBLE_DEVICES=0 $PY scripts/serve_policy.py --env JAKA --num-steps 10
+CUDA_VISIBLE_DEVICES=0 $PY scripts/serve_policy.py --env JAKA --num-steps 10 \
+  policy:checkpoint --policy.config=jaka_tabletop_pick \
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
 
 # 客户端
 cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
 PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM \
 ~/workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python main.py \
   --env jaka_tabletop_pick --remote-host 127.0.0.1 --remote-port 8000 \
-  --jaka-motion-zmq-port 28701 --max-steps 100000 <<< $'s\n'
+  --jaka-state-address "${ROBOT_IP:?请设置机器人 IP}" --jaka-head-image-address "${CAMERA_IP:-$ROBOT_IP}" \
+  --jaka-motion-zmq-port 28701 --max-steps 100000
 ```

@@ -11,64 +11,24 @@ first 33 columns are action. ``[0:27]`` are the reference joints in POLICY order
 in the anchor body frame -- which is precisely the 33-dim layout the policy emits and
 ``JakaTabletopEnv.step()`` consumes. ``[33:40]`` is ``anchor_pos_w`` / ``anchor_quat_w``,
 a DEBUG copy of the recording's own world pose; feeding it would be meaningless (the env
-integrates the pose itself from ``[30:33]``) and this script never touches it.
+integrates the pose itself from ``[30:33]``). The optional initial seed is read from these debug fields.
 
-Three fidelity points that are easy to get wrong:
+The conversion manifest identifies base_link trajectories. For older unmarked datasets,
+--assume-base-link is an explicit assertion about the original poses. A dataset marked
+with a different anchor requires a kinematic conversion before replay.
 
-* **One env instance for the whole run.** ``JakaTabletopEnv.reset()`` deliberately does
-  not reset ``_frame_index`` (the receiver keeps its dedup baseline across its own
-  ``clear()``, so a frame index that goes backwards makes every later frame be dropped
-  downstream) and has no public way to reseed the anchor. Constructing a new env per
-  episode would restart ``frame_index`` at 0 and silently starve the receiver. Reusing one
-  instance is also the physically right thing here: the episodes are consecutive takes of a
-  single session -- episode k's first anchor pose continues episode k-1's last one (yaw
-  91.3 -> 91.3, 93.5 -> 93.7, z 0.851 -> 0.840 across ep0/ep1/ep2) -- so carrying the anchor
-  state across episodes reproduces the recording rather than stitching unrelated takes.
-* **The chunk-boundary stall is reproduced on purpose.** Every ``--open-loop-horizon``
-  steps, production spends ~70-120 ms inferring and publishes nothing at all; the receiver
-  treats a >50 ms gap as a stall and re-anchors its timeline there. A perfectly smooth
-  replay never exercises that path, so ``--infer-pause-ms`` (default 80) inserts the gap at
-  each chunk boundary. Set it to 0 to test the no-stall regime instead.
-* **Cadence is not a knob to slow down with.** The env integrates ``world_vel * 1/control_hz``
-  per step, and the receiver re-anchors on any >50 ms gap, so stretching the frame interval
-  to get slow motion would both change the published trajectory's speed and make every
-  single frame look like a stall. Run it at the real frequency.
+Use --anchor-from-dataset to seed the integrated pose with the first selected episode's
+debug position and yaw, or use the deployment default (0, 0, 0.604 m) or --anchor-pos X Y Z. A single publisher keeps its
+stream ID, pose and monotonic frame indices throughout the invocation. For independently
+seeded episodes use separate runs. Each default two-frame window includes the previous
+and current frames. --infer-pause-ms inserts a pause at each open-loop chunk boundary.
 
-The first frame of each window is buffered but not published (2-frame sliding window, so N
-steps put N-1 messages on the wire; frame k reaches the receiver inside step k+1's window).
-``--dump`` records exactly what was handed to the socket, which is what to diff against
-whatever the robot side logs when checking the wire contract.
+Example offline conversion check::
 
-Run on the robot machine (native, no container), with the receiver already subscribed::
+    python jaka_dataset_action_publisher.py --dataset-root <base_dataset> --episodes 0 \
+        --anchor-from-dataset --dry-run
 
-    cd ~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
-    export PYTHONPATH=~/Workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
-
-    # safety valve: exercise the whole loop without binding/ publishing anything
-    ~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python \
-      jaka_dataset_action_publisher.py --episodes 0 --dry-run
-
-    # one take, real port, production-like stall pattern
-    ~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python \
-      jaka_dataset_action_publisher.py --episodes 0
-
-    # a static take (ep22 barely moves) if you want the robot to hold still first
-    ~/Workspace/OpenHLM/src/openpi4OpenHLM/.venv/bin/python \
-      jaka_dataset_action_publisher.py --episodes 22
-
-``--episodes`` is a tyro tuple: SPACE separated (``--episodes 0 1 2``), not commas. Passing
-the flag with no values (bare ``--episodes``) selects all 47. ``--repeat N`` replays the
-sequence N times, but the anchor state carries over, so the wrap is a pose discontinuity --
-use it only when that is acceptable.
-
-Stopping: Ctrl+C closes the env cleanly. The published pose is a REFERENCE trajectory, so
-nothing needs to be commanded back to a default pose, unlike main.py's robot path.
-
-**Do not restart this script against a live receiver.** Each run starts `frame_index` at 0,
-and the receiver keeps its dedup baseline across its own ``clear()``, so a second run is
-silently dropped in full (the robot just stops responding, with nothing in the log). Either
-cover the whole test in one invocation (``--episodes`` / ``--repeat`` / ``--max-frames 0``)
-or restart the receiver in the same breath as the publisher.
+For local simulation, set --motion-address 127.0.0.1 and the simulator's receive port.
 """
 
 # flake8: noqa: E402
@@ -86,12 +46,14 @@ import numpy as np
 import pyarrow.parquet as pq
 import tyro
 
-from jaka_tabletop_env import PERM_POLICY_TO_SIM, JakaTabletopEnv, _euler_xyz_to_quat_wxyz
+from jaka_tabletop_env import (
+    DEFAULT_INITIAL_ANCHOR_POS, JakaTabletopEnv, PERM_POLICY_TO_SIM, _euler_xyz_to_quat_wxyz,
+    validate_base_replay_dataset,
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-# Training repo id is ``teleop_jaka_mf/level-0`` (shortened). Prefer the freshly converted
-# 40-episode set on this machine, then the new machine's copy, then the legacy layouts.
+# Search the training and deployment machines for the converted jaka_pick dataset.
 _DATASET_LEAF = ("jaka_pick",)
 DATASET_ROOT_CANDIDATES = (
     os.path.join(_REPO_ROOT, "record_teleop", "record_data", "lerobot_train", *_DATASET_LEAF),
@@ -132,9 +94,9 @@ def load_actions(root: str, episode: int) -> np.ndarray:
     path = os.path.join(root, "data", "chunk-000", f"episode_{episode:06d}.parquet")
     table = pq.read_table(path, columns=["actions"])
     actions = np.array(table["actions"].to_pylist(), dtype=np.float32)
-    if actions.shape[1] < ACTION_DIM:
-        raise SystemExit(f"{path}: actions are {actions.shape[1]}-wide, expected >= {ACTION_DIM}")
-    return actions[:, :ACTION_DIM]  # exactly the policy's output layout
+    if actions.ndim != 2 or not len(actions) or actions.shape[1] < ACTION_DIM:
+        raise ValueError(f"{path}: expected a nonempty array of actions at least {ACTION_DIM} wide")
+    return actions
 
 
 def anchor_seed_from_dataset(actions: np.ndarray) -> tuple[tuple, tuple]:
@@ -146,6 +108,8 @@ def anchor_seed_from_dataset(actions: np.ndarray) -> tuple[tuple, tuple]:
     """
     from scipy.spatial.transform import Rotation
 
+    if actions.shape[1] < 40:
+        raise ValueError("--anchor-from-dataset requires the recorded world position and quaternion in actions[33:40]")
     pos = tuple(float(v) for v in actions[0, 33:36])
     quat_xyzw = np.roll(actions[0, 36:40].astype(np.float64), -1)  # wxyz -> xyzw
     yaw = float(Rotation.from_quat(quat_xyzw).as_euler("xyz")[2])
@@ -155,7 +119,7 @@ def anchor_seed_from_dataset(actions: np.ndarray) -> tuple[tuple, tuple]:
 @dataclasses.dataclass
 class Args:
     dataset_root: str = DEFAULT_DATASET_ROOT
-    episodes: tuple[int, ...] = (0,)  # SPACE separated, e.g. --episodes 0 1 2; bare = all 47
+    episodes: tuple[int, ...] = (0,)  # SPACE separated, e.g. --episodes 0 1 2; bare = all episodes
     max_frames: int = 0               # >0 = stop after this many frames overall
     repeat: int = 1                   # replays the episode sequence this many times
 
@@ -168,11 +132,9 @@ class Args:
     motion_port: int = 28701          # the real deployment port
     num_frames_to_send: int = 2       # 2 = sliding window [i-1, i]
 
-    # Defaults are main.py's deployment defaults, so the published poses sit in the same
-    # frame production uses: anchor = base_link, z = recorded base height (~0.604 m, not
-    # the 0.22385 m higher waist). --anchor-from-dataset instead reproduces the
-    # recording's own absolute origin (its yaw is arbitrary; x/y do not matter).
-    anchor_pos: tuple[float, float, float] = (0.0, 0.0, 0.604)
+    # For a verified, unmarked base_link dataset only. A known waist dataset is rejected.
+    assume_base_link: bool = False
+    anchor_pos: tuple[float, float, float] = DEFAULT_INITIAL_ANCHOR_POS
     anchor_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
     anchor_from_dataset: bool = False
 
@@ -192,6 +154,9 @@ def main(args: Args):
             f"pass --dataset-root <path to the level-0 dir> if it lives elsewhere"
         )
 
+    validate_base_replay_dataset(root, assume_base_link=args.assume_base_link)
+    if args.open_loop_horizon < 1:
+        raise ValueError("open_loop_horizon must be positive")
     lengths = episode_lengths(root)
     episodes = list(args.episodes) if args.episodes else sorted(lengths)
     for ep in episodes:
@@ -201,7 +166,7 @@ def main(args: Args):
     actions_cache = {ep: load_actions(root, ep) for ep in episodes}
 
     anchor_pos, anchor_rpy = args.anchor_pos, args.anchor_rpy
-    seed_note = "main.py's deployment defaults"
+    seed_note = "specified initial anchor pose"
     if args.anchor_from_dataset:
         anchor_pos, anchor_rpy = anchor_seed_from_dataset(actions_cache[episodes[0]])
         seed_note = f"ep{episodes[0]} frame 0 (recording's own origin)"
@@ -227,7 +192,7 @@ def main(args: Args):
 
     target_dt = 1.0 / args.control_hz
     n_published = 0
-    t_start = time.time()
+    t_start = time.monotonic()
     frames = {
         "frame_index": [], "joint_pos": [], "body_pos_w": [], "body_quat_w": [],
         "action_joint_policy": [],
@@ -236,12 +201,12 @@ def main(args: Args):
 
     try:
         for rep in range(max(args.repeat, 1)):
-            for ep in episodes:
+            for ep_index, ep in enumerate(episodes):
                 actions = actions_cache[ep]
                 print(f"\n[ep{ep}] {len(actions)} frames"
                       + (f"  (repeat {rep + 1}/{args.repeat})" if args.repeat > 1 else ""))
 
-                if ep != episodes[0] or rep > 0:
+                if ep_index > 0 or rep > 0:
                     # Clears the 2-frame window (so the first step of the take does not
                     # publish a window mixing two takes) while frame_index and the anchor
                     # state keep advancing -- see the module docstring.
@@ -250,10 +215,10 @@ def main(args: Args):
                 # One "chunk" per open_loop_horizon steps, so the stall pattern matches
                 # production's: infer ~80 ms, then publish 25 frames at 30 Hz.
                 for t0 in range(0, len(actions), args.open_loop_horizon):
-                    if args.infer_pause_ms > 0 and not (t0 == 0 and ep == episodes[0] and rep == 0):
+                    if args.infer_pause_ms > 0 and not (t0 == 0 and ep_index == 0 and rep == 0):
                         time.sleep(args.infer_pause_ms / 1000.0)
                     for t in range(t0, min(t0 + args.open_loop_horizon, len(actions))):
-                        start = time.time()
+                        start = time.monotonic()
                         if args.dump:
                             # Snapshot the pose step() is ABOUT to publish, using the env's
                             # own helpers so the dump cannot drift from the wire. It has to
@@ -265,7 +230,7 @@ def main(args: Args):
                             pub_body_quat = _euler_xyz_to_quat_wxyz(
                                 float(actions[t][27]), float(actions[t][28]), env._accumulated_yaw
                             )
-                        env.step(actions[t])
+                        env.step(actions[t, :ACTION_DIM])
                         n_published += 1
                         if args.dump:
                             frames["frame_index"].append(n_published - 1)
@@ -275,24 +240,24 @@ def main(args: Args):
                             frames["action_joint_policy"].append(actions[t][0:27].copy())
                         if n_published >= next_report:
                             next_report += args.control_hz
-                            hz = n_published / max(time.time() - t_start, 1e-9)
+                            hz = n_published / max(time.monotonic() - t_start, 1e-9)
                             print(f"   frame {n_published:6d}   ep{ep} t={t:4d}   "
-                                  f"mean {hz:5.1f} Hz   t+{time.time() - t_start:6.1f}s")
+                                  f"mean {hz:5.1f} Hz   t+{time.monotonic() - t_start:6.1f}s")
                         if args.max_frames and n_published >= args.max_frames:
                             raise KeyboardInterrupt
-                        elapsed = time.time() - start
+                        elapsed = time.monotonic() - start
                         if elapsed < target_dt:
                             time.sleep(target_dt - elapsed)
 
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
-        elapsed = time.time() - t_start
+        elapsed = time.monotonic() - t_start
         print(f"\npublished {n_published} steps in {elapsed:.1f} s "
               f"({n_published / max(elapsed, 1e-9):.1f} Hz mean)")
         if not args.dry_run:
-            print(f"frame_index advanced to {env._frame_index - 1}; "
-                  f"the receiver must have seen each index once (N steps -> N-1 messages)")
+            print(f"Last local frame index: {env._frame_index - 1}. "
+                  "Check the receiver's tracking diagnostics for delivery.")
         if args.dump and n_published:
             out = Path(args.dump)
             out.parent.mkdir(parents=True, exist_ok=True)
