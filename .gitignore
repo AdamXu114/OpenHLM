@@ -193,6 +193,9 @@ external_dependencies/XRoboToolkit-PC-Service-Pybind/
 # UV
 uv.lock
 
+# 由 setup_env.sh 生成的本机环境变量文件（含绝对路径，不入库）
+/env.sh
+
 # Virtual environments (created by install_scripts/)
 .venv_sim/
 .venv_teleop/
