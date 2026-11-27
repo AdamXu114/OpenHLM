@@ -300,6 +300,11 @@ class JakaTabletopEnv:
         self._last_state_publish_ns = None
         self._previous_observed_yaw = None  # (local monotonic time, yaw) of selected state
 
+        # RX instrumentation for the periodic loop statistics (main.py / openloop script).
+        self._rx_count = {"image": 0, "state": 0}
+        self._rx_last_ns = {"image": None, "state": None}
+        self._rx_max_gap_ns = {"image": 0, "state": 0}
+
     # ------------------------------------------------------------------
     # Action path
     # ------------------------------------------------------------------
@@ -394,6 +399,7 @@ class JakaTabletopEnv:
                 if w > 0 and h > 0 and len(payload) == w * h * c and c in (3, 4):
                     img = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, c))
                     head = img[..., :3] if c == 4 else img  # RGB(A) -> RGB
+                    self._note_rx("image")
                 else:
                     print(
                         f"Error reading jaka head image: header says {w}x{h}x{c} "
@@ -432,6 +438,7 @@ class JakaTabletopEnv:
 
             self._last_state_publish_ns = t_ns
             state = (joints_sim[PERM_SIM_TO_POLICY], roll, pitch, raw_yaw)
+            self._note_rx("state")
         except zmq.Again:
             pass
         except Exception as e:  # noqa: BLE001
@@ -474,6 +481,27 @@ class JakaTabletopEnv:
             if now >= deadline:
                 raise TimeoutError(f"No fresh {' and '.join(stale)} for JAKA base_link inference")
             time.sleep(min(0.002, deadline - now))
+
+    def _note_rx(self, name: str) -> None:
+        """Count one successfully parsed message of ``name`` and track the max gap."""
+        now = time.monotonic_ns()
+        last = self._rx_last_ns[name]
+        if last is not None:
+            self._rx_max_gap_ns[name] = max(self._rx_max_gap_ns[name], now - last)
+        self._rx_last_ns[name] = now
+        self._rx_count[name] += 1
+
+    def rx_snapshot(self, reset: bool = False) -> dict:
+        """Messages received per channel since the last ``reset=True`` call."""
+        out = {
+            name: {"count": self._rx_count[name], "max_gap_s": self._rx_max_gap_ns[name] / 1e9}
+            for name in self._rx_count
+        }
+        if reset:
+            for name in self._rx_count:
+                self._rx_count[name] = 0
+                self._rx_max_gap_ns[name] = 0
+        return out
 
     def get_observation(self):
         """Return ``{"head_image_left": (H, W, 3) uint8 RGB, "state": (30,) float32}``.

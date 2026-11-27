@@ -94,7 +94,7 @@ tail -f "$LOG" | grep --line-buffered -o 'step=[0-9]* loss=[0-9.]*.*'
 cd /workspace/OpenHLM/src/openpi4OpenHLM
 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config jaka_tabletop_pick \
-  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 
 # 客户端（容器内，三要素：PYTHONPATH + --no-opencv-visualize + 喂 stdin）
 docker exec -i -w /workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval \
@@ -135,7 +135,7 @@ docker exec -i -w /workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-e
 | Jaka ZMQ 端口 | 28701（motion）/ 28711（state）/ 28712（head image） |
 | 策略服务端口 | 8000 |
 | 控制频率 / 开环 horizon | 30 Hz / 25 步（horizon 50） |
-| 当前实机 ckpt | `jaka_pick_real_v1` step 30000 |
+| 当前实机 ckpt | `jaka_pick_real_v2` step 30000 |
 
 ## 应急
 

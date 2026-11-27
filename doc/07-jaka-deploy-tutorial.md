@@ -19,7 +19,7 @@
 ls ~/workspace/OpenHLM/src/openpi4OpenHLM/scripts/serve_policy.py
 
 # 检查本机的 base_link checkpoint
-ls -l ~/workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000/model.safetensors
+ls -l ~/workspace/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000/model.safetensors
 ```
 
 需要的文件（都已就位，无需改动）：
@@ -59,7 +59,7 @@ tmux new -s jakadep
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config jaka_tabletop_pick \
-  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 ```
 
 等到出现监听日志（默认 `0.0.0.0:8000`）再进下一步。

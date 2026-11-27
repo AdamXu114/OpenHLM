@@ -65,12 +65,18 @@ tmux capture-pane -pt jakatrain | tail -50
 tail -f /workspace/OpenHLM/src/openpi4OpenHLM/logs/jaka_v1_*.log
 ```
 
-## 当前项目状态（2026-09-18）
+## 历史项目状态（2026-09-18）
 
 - 任务：`jaka_tabletop_pick`（Jaka 机械臂桌面抓取）
 - 训练 run：`jaka_tabletop_pick_v1`，已跑到 step 30000
 - Checkpoint：`src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/<step>/`（5000/10000/15000/20000/25000/30000）
 - 部署侧：`src/GR00T-WholeBodyControl4OpenHLM/openpi-eval/jaka_tabletop_env.py`（ZMQ 端口 28701），已通过 mock 测试，真机端到端待验证
+
+## 当前部署模型（2026-11-27）
+
+- 最新实机数据训练 checkpoint：`src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000/`。
+- 导入来源为 `~/下载/30000.zip`；原始训练实验名为 `jaka_pick_real_v1`，本地以 `v2` 目录名保留新旧两份。
+- 实机部署启动参数以 [11 本机部署](11-local-deploy.md) 为准；旧仿真权重 `jaka_tabletop_pick_v1` 不要用于当前实机部署。
 
 ## 约定
 

@@ -13,41 +13,30 @@
 | 代理 | 不需要 | 需要 `~/.ssh/config`/`Base_bash.md` 里的隧道 |
 | 训练 | **不要在本机训练**（24 GB 放不下权重+优化器状态） | 训练在这里跑 |
 
-## 1. 下载 checkpoint
+## 1. 当前实机 checkpoint
 
-训练在服务器完成，产物在：
+2026-11-27 导入新训练的 30000-step 实机 checkpoint。压缩包内训练实验名仍是 `jaka_pick_real_v1`；为与已有副本区分且保留回滚，落盘目录命名为 `jaka_pick_real_v2`，没有覆盖原目录：
 
 ```text
-/data0/xujinfan/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000/
-├── assets/            # 含 norm_stats.json，推理靠它
-├── metadata.pt
-└── model.safetensors  # bf16，整目录约 7.0 GB
+~/下载/30000.zip
+  -> src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000/
+     ├── assets/jaka_pick/norm_stats.json
+     ├── metadata.pt
+     └── model.safetensors
 ```
 
-下载到本机（保持同样的目录名，`serve_policy.py` 用相对路径）：
+`.cache/huggingface` 上传缓存没有解压。原来的 `jaka_pick_real_v1/30000` 仍保留；旧仿真 checkpoint 则是 `jaka_tabletop_pick_v1/30000`。**当前部署使用 v2 路径**：
 
 ```bash
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
-mkdir -p checkpoints/jaka_tabletop_pick/jaka_pick_real_v1
-
-rsync -avP -e 'ssh -p 9980' \
-  xujinfan@zz.irmv.top:/data0/xujinfan/OpenHLM/src/openpi4OpenHLM/checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000 \
-  checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/
+CKPT=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
+test -s "$CKPT/model.safetensors" && test -s "$CKPT/assets/jaka_pick/norm_stats.json"
 ```
 
-校验：
-
-```bash
-ls checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
-# assets  metadata.pt  model.safetensors
-du -sh checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000   # ≈ 7.0G
-```
-
-> 如果这次训练已经传到 HuggingFace，也可以 `hf download XuJinfan/<repo> --local-dir ...`，
-> 旧 v1 的做法见 [07](07-jaka-deploy-tutorial.md) §准备。
+如部署在另一台机器，需先把整个 `jaka_pick_real_v2/30000` 目录同步过去；之后按下方命令启动服务。
 
 本机目前还留着旧仿真数据训练的 `checkpoints/jaka_tabletop_pick/jaka_tabletop_pick_v1/30000`，
-**不要**把它当成新模型。
+**不要**把它当成当前实机模型。
 
 ## 2. norm stats
 
@@ -70,7 +59,7 @@ export CUDA_VISIBLE_DEVICES=0
   --port 8000 \
   policy:checkpoint \
   --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 ```
 
 - 服务端 CLI 的枚举参数用 `--env JAKA`，训练配置用 `--policy.config=jaka_tabletop_pick`。JAKA 服务要求显式选择 checkpoint，以免自动加载旧的 waist 权重。

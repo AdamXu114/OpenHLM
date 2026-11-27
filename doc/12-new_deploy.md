@@ -1,6 +1,6 @@
 # 12　Khan 实机部署：pi0.5 抓取策略与 180k EMA tracker
 
-本流程使用 OpenHLM `dev` 的 `0827d35`、带 VLA motion buffer 的机器人控制器 `fde4c70`、实机抓取 checkpoint `jaka_pick_real_v1/30000` 和 tracker `ckpt_0180000_bones_ema.onnx`。假设机器人部署包、ROS 2 Humble 相机工作区和 OpenHLM 推理环境已经安装。权重下载和环境准备见 [11 本机部署](11-local-deploy.md)。
+本流程使用 OpenHLM `dev` 的 `0827d35`、带 VLA motion buffer 的机器人控制器 `fde4c70`、实机抓取 checkpoint `jaka_pick_real_v2/30000` 和 tracker `ckpt_0180000_bones_ema.onnx`。假设机器人部署包、ROS 2 Humble 相机工作区和 OpenHLM 推理环境已经安装。权重下载和环境准备见 [11 本机部署](11-local-deploy.md)。
 
 首轮顺序为 **策略服务和预热 → 机器人控制器留在 IDLE → 相机驱动和 RGB 桥接器 → 机器人到起始姿态并进入 SuperZmq → 启动客户端 → 在客户端输入 `s` 回车**。
 
@@ -25,7 +25,7 @@ git switch dev
 git pull --ff-only origin dev
 cd src/openpi4OpenHLM
 export CUDA_VISIBLE_DEVICES=0
-CKPT=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+CKPT=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 
 test -s "$CKPT/model.safetensors" &&
 test -s "$CKPT/assets/jaka_pick/norm_stats.json" &&

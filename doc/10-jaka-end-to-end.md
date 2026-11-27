@@ -202,7 +202,7 @@ cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py \
   --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 ```
 
 看到 `server listening on 0.0.0.0:8000` 即可 `Ctrl+C`。
@@ -237,7 +237,7 @@ PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM \
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 ```
 
 ### 5.3 起客户端（终端 2 / tmux 窗口 2）
@@ -282,7 +282,7 @@ export PYTHONPATH=~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM
 cd ~/workspace/OpenHLM/src/openpi4OpenHLM
 CUDA_VISIBLE_DEVICES=0 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 
 # 终端 2：客户端（等终端 1 打印 listening 后再起）
 cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval
@@ -352,7 +352,7 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false WANDB_MODE=offline PYTHONUNBUFFERED=1 \
 # 服务端
 CUDA_VISIBLE_DEVICES=0 $PY scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config=jaka_tabletop_pick \
-  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir=checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 
 # 客户端
 cd ~/workspace/OpenHLM/src/GR00T-WholeBodyControl4OpenHLM/openpi-eval

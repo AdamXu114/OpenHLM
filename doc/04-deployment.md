@@ -30,7 +30,7 @@ export CUDA_VISIBLE_DEVICES=<预约的卡号>
 
 ./.venv/bin/python scripts/serve_policy.py --env JAKA --num-steps 10 \
   policy:checkpoint --policy.config jaka_tabletop_pick \
-  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v1/30000
+  --policy.dir checkpoints/jaka_tabletop_pick/jaka_pick_real_v2/30000
 ```
 
 服务端通过显式路径加载已确认由 base_link 数据训练的权重。JAKA 的 33 维输出本身无法标识训练时的 anchor。

@@ -23,6 +23,7 @@ from openpi_client import websocket_client_policy
 
 from sonic_g1_env import SonicG1Env, DEFAULT_MIMIC_OBS_G1, DEFAULT_MIMIC_OBS_G1_RAISED
 from jaka_tabletop_env import DEFAULT_INITIAL_ANCHOR_POS, DEFAULT_STATE_JAKA, JakaTabletopEnv
+from loop_stats import PeriodicStats
 
 ########################################################
 # copy and paste the following code to SONIC codebase
@@ -383,6 +384,9 @@ def run_rollouts(args, env, action_dim, num_cameras):
             jaka_action_chunk(result, args.open_loop_horizon)
     print(f"Policy server warmed up in {time.time() - start_time:.3f} seconds.")
 
+    # Periodic timing probe (prints every 3 s): inference / publish / observation rates.
+    stats = PeriodicStats(interval_s=3.0)
+
     # Generate timestamp once for all episodes (used for saving action chunks)
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M") if args.save_action_chunk else None
 
@@ -443,6 +447,7 @@ def run_rollouts(args, env, action_dim, num_cameras):
             try:
                 # Get the current observation
                 obs = env.get_observation()
+                stats.record("obs")
                 
                 # Record state if saving is enabled
                 if args.save_action_chunk:
@@ -481,6 +486,7 @@ def run_rollouts(args, env, action_dim, num_cameras):
                             if args.env == "jaka_tabletop_pick" else result["actions"]
                         )
                     policy_inference_time = time.time() - inference_start
+                    stats.record("infer")
                     
                     # Record action chunk if saving is enabled
                     if args.save_action_chunk:
@@ -505,6 +511,7 @@ def run_rollouts(args, env, action_dim, num_cameras):
 
                 # Send action to environment
                 env.step(action)
+                stats.record("publish")
 
                 # Increment action step counter if saving is enabled
                 if args.save_action_chunk:
@@ -525,6 +532,14 @@ def run_rollouts(args, env, action_dim, num_cameras):
                     "policy_infer_time": f"{policy_inference_time*1000:.1f}ms",
                     "actual_hz": f"{actual_control_hz:.1f}"
                 })
+
+                if hasattr(env, "rx_snapshot"):
+                    snap = env.rx_snapshot(reset=True)
+                    for rx_name in ("image", "state"):
+                        stats.note_external(
+                            rx_name, snap[rx_name]["count"], snap[rx_name]["max_gap_s"]
+                        )
+                stats.maybe_print()
             except KeyboardInterrupt:
                 print("\n\nCtrl+C detected.")
                 if video_writer is not None:
@@ -588,6 +603,8 @@ def run_rollouts(args, env, action_dim, num_cameras):
         if args.env == "sonic_g1":
             time.sleep(2.0)
             print("Reset complete.")
+
+    stats.flush()
 
     # Final cleanup: reset robot to default pose before exiting
     if args.env == "sonic_g1":
